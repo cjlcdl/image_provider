@@ -5,6 +5,8 @@ class TransferProgressDialog extends StatelessWidget {
     super.key,
     required this.title,
     required this.fileName,
+    this.summaryText,
+    this.detailText,
     required this.transferredBytes,
     required this.totalBytes,
     required this.active,
@@ -13,6 +15,8 @@ class TransferProgressDialog extends StatelessWidget {
 
   final String title;
   final String fileName;
+  final String? summaryText;
+  final String? detailText;
   final int transferredBytes;
   final int? totalBytes;
   final bool active;
@@ -44,12 +48,23 @@ class TransferProgressDialog extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontWeight: FontWeight.w600),
             ),
+            if (summaryText != null && summaryText!.trim().isNotEmpty) ...<Widget>[
+              const SizedBox(height: 8),
+              Text(
+                summaryText!,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
             const SizedBox(height: 16),
             LinearProgressIndicator(value: progressValue),
             const SizedBox(height: 12),
             Text(progressText),
             const SizedBox(height: 4),
             Text(percentText, style: Theme.of(context).textTheme.bodySmall),
+            if (detailText != null && detailText!.trim().isNotEmpty) ...<Widget>[
+              const SizedBox(height: 6),
+              Text(detailText!, style: Theme.of(context).textTheme.bodySmall),
+            ],
           ],
         ),
       ),

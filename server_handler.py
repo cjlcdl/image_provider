@@ -8,7 +8,12 @@ from urllib.parse import parse_qs, urlsplit
 import server_state as state
 from config import CLEANUP_HOUR, DOWNLOAD_TOKEN_MAX_DAYS, FILE_ROUTE_PREFIX, HOST, PERMANENT_TOKEN_HEADER, PORT
 from folder_index import folder_requires_password, get_disk_capacity, get_folder
-from server_auth import is_permanent_token_verification_available, validate_folder_password_token, validate_permanent_token
+from server_auth import (
+    is_permanent_token_verification_available,
+    validate_folder_password_token,
+    validate_folder_passwords_token,
+    validate_permanent_token,
+)
 from server_handlers_files import FileManagementHandlerMixin
 from server_handlers_folders import FolderManagementHandlerMixin
 from server_handlers_upload import UploadHandlerMixin
@@ -135,6 +140,39 @@ class BaseStorageProviderHandler(BaseHTTPRequestHandler):
             self.send_error_json(status, code, message)
             return None
         return password
+
+    def require_folder_passwords(
+        self,
+        folder_ids: list,
+        header_name: str = state.FOLDER_PASSWORDS_TOKEN_HEADER,
+    ) -> Optional[Dict[str, str]]:
+        normalized_folder_ids = []
+        for folder_id in folder_ids:
+            normalized_folder_id = normalize_folder_id(folder_id)
+            if normalized_folder_id:
+                normalized_folder_ids.append(normalized_folder_id)
+
+        if not normalized_folder_ids:
+            return {}
+
+        token_value = self.headers.get(header_name, "").strip()
+        if not token_value:
+            self.send_error_json(HTTPStatus.UNAUTHORIZED, 40107, "missing folder passwords token")
+            return None
+
+        is_valid, passwords, code, message = validate_folder_passwords_token(
+            token_value,
+            normalized_folder_ids,
+        )
+        if not is_valid:
+            status = HTTPStatus.UNAUTHORIZED if code < 50000 else HTTPStatus.INTERNAL_SERVER_ERROR
+            if code == 40302:
+                status = HTTPStatus.FORBIDDEN
+            if code == 40403:
+                status = HTTPStatus.NOT_FOUND
+            self.send_error_json(status, code, message)
+            return None
+        return passwords or {}
 
     def write_audit_log(
         self,
@@ -290,6 +328,10 @@ class BaseStorageProviderHandler(BaseHTTPRequestHandler):
 
         if request_path == "/api/folders/download-link":
             self.handle_create_download_link()
+            return
+
+        if request_path == "/api/folders/archive":
+            self.handle_download_folder_archive()
             return
 
         upload_id, upload_action = self.parse_resumable_upload_path(request_path)

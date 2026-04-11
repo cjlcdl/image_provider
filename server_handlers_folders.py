@@ -1,9 +1,14 @@
 import mimetypes
+import shutil
+import tempfile
+import zipfile
 from http import HTTPStatus
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 import server_state as state
 from folder_index import (
+    build_folder_name_chain,
     change_folder_password,
     collect_descendant_folder_ids,
     create_download_token,
@@ -27,9 +32,37 @@ from server_storage import (
     upsert_file_index_record,
 )
 from server_utils import folder_allows_direct_download, normalize_folder_id
+from server_utils import build_content_disposition, sanitize_index_name
 
 
 class FolderManagementHandlerMixin:
+    def _build_archive_relative_folder_path(self, root_folder_id: str, folder_id: str) -> str:
+        root_chain = build_folder_name_chain(root_folder_id)
+        folder_chain = build_folder_name_chain(folder_id)
+        if not root_chain or not folder_chain:
+            return "archive"
+        relative_parts = folder_chain[len(root_chain) :]
+        return str(PurePosixPath(root_chain[-1], *relative_parts))
+
+    def _build_unique_archive_path(self, used_paths: set, directory_path: str, file_name: str) -> str:
+        safe_name = sanitize_index_name(file_name) or "download"
+        candidate_path = str(PurePosixPath(directory_path, safe_name))
+        if candidate_path not in used_paths:
+            used_paths.add(candidate_path)
+            return candidate_path
+
+        file_path = PurePosixPath(safe_name)
+        base_name = file_path.stem or "download"
+        extension = file_path.suffix
+        index = 1
+        while True:
+            candidate_name = "{} ({}){}".format(base_name, index, extension)
+            candidate_path = str(PurePosixPath(directory_path, candidate_name))
+            if candidate_path not in used_paths:
+                used_paths.add(candidate_path)
+                return candidate_path
+            index += 1
+
     def handle_list_folders(self) -> None:
         if not self.authorize_management_request():
             return
@@ -495,3 +528,115 @@ class FolderManagementHandlerMixin:
                 },
             },
         )
+
+    def handle_download_folder_archive(self) -> None:
+        if not self.authorize_management_request():
+            return
+
+        payload = self.read_json_body()
+        if payload is None:
+            return
+
+        folder_id = normalize_folder_id(payload.get("folderId"))
+        if not folder_id:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, 40031, "missing folder id")
+            return
+
+        folder_record = get_folder(folder_id)
+        if folder_record is None:
+            self.send_error_json(HTTPStatus.NOT_FOUND, 40403, "folder not found")
+            return
+
+        descendant_folder_ids = collect_descendant_folder_ids(folder_id)
+        related_folder_ids = [folder_id, *descendant_folder_ids]
+        encrypted_folder_ids = []
+        for related_folder_id in related_folder_ids:
+            related_record = get_folder(related_folder_id)
+            if folder_requires_password(related_record):
+                encrypted_folder_ids.append(related_folder_id)
+
+        if encrypted_folder_ids:
+            passwords = self.require_folder_passwords(encrypted_folder_ids)
+            if passwords is None:
+                return
+
+        archive_name = "{}.zip".format(sanitize_index_name(str(folder_record.get("name", "archive"))) or "archive")
+        folder_id_set = set(related_folder_ids)
+        folder_paths = {
+            related_folder_id: self._build_archive_relative_folder_path(folder_id, related_folder_id)
+            for related_folder_id in related_folder_ids
+        }
+
+        file_count = 0
+        archive_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        archive_temp_path = archive_temp.name
+        archive_temp.close()
+
+        try:
+            used_archive_paths = set()
+            with zipfile.ZipFile(
+                archive_temp_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive_file:
+                for related_folder_id in related_folder_ids:
+                    folder_path = folder_paths.get(related_folder_id)
+                    if folder_path:
+                        archive_file.writestr("{}/".format(folder_path.rstrip("/")), "")
+
+                for file_item in list_all_files():
+                    item_folder_id = normalize_folder_id(file_item.get("folderId"))
+                    if item_folder_id not in folder_id_set:
+                        continue
+
+                    relative_path = str(file_item.get("path", ""))
+                    resolved = resolve_relative_path(relative_path)
+                    if resolved is None:
+                        continue
+
+                    storage_type, target_path, normalized_path = resolved
+                    if not target_path.exists() or not target_path.is_file():
+                        remove_file_index_record(storage_type, normalized_path)
+                        continue
+
+                    archive_directory = folder_paths.get(item_folder_id)
+                    if not archive_directory:
+                        continue
+
+                    indexed_name = str(file_item.get("indexedName") or target_path.name)
+                    archive_entry_path = self._build_unique_archive_path(
+                        used_archive_paths,
+                        archive_directory,
+                        indexed_name,
+                    )
+                    archive_file.write(target_path, arcname=archive_entry_path)
+                    file_count += 1
+
+            final_archive_path = Path(archive_temp_path)
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(final_archive_path.stat().st_size))
+            self.send_header("Content-Disposition", build_content_disposition("attachment", archive_name))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+            with final_archive_path.open("rb") as archive_stream:
+                shutil.copyfileobj(archive_stream, self.wfile, state.UPLOAD_CHUNK_SIZE)
+
+            self.write_audit_log(
+                action_type="download_folder_archive",
+                indexed_name=str(folder_record.get("name", "")),
+                file_path=str(folder_paths.get(folder_id, "/")),
+                extra={
+                    "resourceType": "folder",
+                    "folderId": folder_id,
+                    "archiveName": archive_name,
+                    "folderCount": len(related_folder_ids),
+                    "fileCount": file_count,
+                },
+            )
+        finally:
+            temp_archive_path = Path(archive_temp_path)
+            temp_archive_path.unlink(missing_ok=True)

@@ -19,11 +19,30 @@ USER = [
 ]
 
 
+def resolve_executable(executable_name: str) -> str:
+    candidates = [executable_name]
+    if os.name == "nt" and not Path(executable_name).suffix:
+        candidates = [f"{executable_name}.bat", f"{executable_name}.cmd", executable_name]
+
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise FileNotFoundError(f"Could not find '{executable_name}' in PATH.")
+
+
+FLUTTER_COMMAND = resolve_executable("flutter")
+
+
 def run_command(command):
     printable = command if isinstance(command, str) else " ".join(command)
     print(f"Executing: {printable}")
     try:
         subprocess.check_call(command, shell=isinstance(command, str), cwd=SCRIPT_DIR)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     except subprocess.CalledProcessError as e:
         print(f"Error: {e.returncode}")
         sys.exit(1)
@@ -41,7 +60,7 @@ try:
     generate_public_key()
     for user in USER:
         command = [
-            "flutter",
+            FLUTTER_COMMAND,
             "build",
             "apk",
             "--release",

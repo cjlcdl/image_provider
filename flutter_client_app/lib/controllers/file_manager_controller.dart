@@ -3,12 +3,91 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 import 'package:courage_storage/models/base_url_preset.dart';
 import 'package:courage_storage/models/file_list_response.dart';
 import 'package:courage_storage/models/indexed_folder.dart';
 import 'package:courage_storage/models/managed_file.dart';
 import 'package:courage_storage/services/image_bed_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+typedef FolderPasswordResolver = Future<String?> Function(
+  IndexedFolder folder,
+  String purpose,
+);
+
+typedef BatchTransferProgressCallback = void Function(
+  BatchTransferProgress progress,
+);
+
+class BatchTransferProgress {
+  const BatchTransferProgress({
+    required this.currentItemLabel,
+    required this.completedItems,
+    required this.succeededItems,
+    required this.failedItems,
+    required this.totalItems,
+    required this.transferredBytes,
+    required this.totalBytes,
+    required this.statusText,
+  });
+
+  final String currentItemLabel;
+  final int completedItems;
+  final int succeededItems;
+  final int failedItems;
+  final int totalItems;
+  final int transferredBytes;
+  final int totalBytes;
+  final String statusText;
+}
+
+class BatchTransferFailure {
+  const BatchTransferFailure({
+    required this.type,
+    required this.label,
+    required this.error,
+  });
+
+  final BatchTransferFailureType type;
+  final String label;
+  final String error;
+}
+
+enum BatchTransferFailureType {
+  network,
+  password,
+  serverRejected,
+}
+
+extension BatchTransferFailureTypeLabel on BatchTransferFailureType {
+  String get label {
+    switch (this) {
+      case BatchTransferFailureType.network:
+        return '网络失败';
+      case BatchTransferFailureType.password:
+        return '密码失败';
+      case BatchTransferFailureType.serverRejected:
+        return '服务端拒绝';
+    }
+  }
+}
+
+class BatchUploadResult {
+  const BatchUploadResult({
+    required this.totalItems,
+    required this.succeededItems,
+    required this.failedItems,
+    required this.failures,
+  });
+
+  final int totalItems;
+  final int succeededItems;
+  final int failedItems;
+  final List<BatchTransferFailure> failures;
+
+  bool get success => failedItems == 0;
+}
 
 class BaseUrlLatencyResult {
   const BaseUrlLatencyResult({
@@ -80,6 +159,8 @@ class FileManagerController extends ChangeNotifier {
   ManagedFile? _previewFile;
   Uint8List? _previewImageBytes;
   String? _previewError;
+  int _previewTransferredBytes = 0;
+  int? _previewTotalBytes;
 
   bool get busy => _busy;
   bool get previewLoading => _previewLoading;
@@ -128,6 +209,8 @@ class FileManagerController extends ChangeNotifier {
   ManagedFile? get previewFile => _previewFile;
   Uint8List? get previewImageBytes => _previewImageBytes;
   String? get previewError => _previewError;
+  int get previewTransferredBytes => _previewTransferredBytes;
+  int? get previewTotalBytes => _previewTotalBytes;
 
   IndexedFolder? get currentFolder {
     final folderId = _currentFolderId;
@@ -153,6 +236,46 @@ class FileManagerController extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  List<IndexedFolder> descendantFoldersOf(String folderId) {
+    final normalizedFolderId = folderId.trim();
+    if (normalizedFolderId.isEmpty) {
+      return const <IndexedFolder>[];
+    }
+
+    final childrenByParent = <String?, List<IndexedFolder>>{};
+    for (final folder in _folders) {
+      childrenByParent.putIfAbsent(folder.parentId, () => <IndexedFolder>[]).add(folder);
+    }
+
+    final descendants = <IndexedFolder>[];
+    final pending = <String>[normalizedFolderId];
+    while (pending.isNotEmpty) {
+      final currentId = pending.removeLast();
+      final children = childrenByParent[currentId] ?? const <IndexedFolder>[];
+      for (final child in children) {
+        descendants.add(child);
+        pending.add(child.id);
+      }
+    }
+
+    descendants.sort((left, right) => _compareFolderPath(left, right));
+    return descendants;
+  }
+
+  List<IndexedFolder> encryptedFoldersForArchive(String folderId) {
+    final rootFolder = folderById(folderId);
+    if (rootFolder == null) {
+      return const <IndexedFolder>[];
+    }
+
+    final result = <IndexedFolder>[
+      if (rootFolder.encrypted) rootFolder,
+      ...descendantFoldersOf(folderId).where((folder) => folder.encrypted),
+    ];
+    result.sort((left, right) => _compareFolderPath(left, right));
+    return result;
   }
 
   List<IndexedFolder> get currentChildFolders {
@@ -334,6 +457,8 @@ class FileManagerController extends ChangeNotifier {
     _previewImageBytes = null;
     _previewError = null;
     _previewLoading = false;
+    _previewTransferredBytes = 0;
+    _previewTotalBytes = null;
     notifyListeners();
   }
 
@@ -600,31 +725,12 @@ class FileManagerController extends ChangeNotifier {
     String? folderId,
     String? folderPassword,
   }) async {
-    final effectiveFolderId = folderId ?? _currentFolderId;
-    final effectiveFolderPassword =
-        folderPassword ?? unlockedFolderPassword(effectiveFolderId);
-    final result = await _runAction<Map<String, dynamic>>(
-      '上传',
-      () => permanent
-          ? _client.uploadPermanent(
-              file: file,
-              publicKeyPem: _requirePublicKey(_publicKeyPem),
-              folderId: effectiveFolderId,
-              folderPassword: effectiveFolderPassword,
-            )
-          : _client.uploadTemporary(
-              file,
-              publicKeyPem: _publicKeyPem,
-              folderId: effectiveFolderId,
-              folderPassword: effectiveFolderPassword,
-            ),
+    return uploadFilesWithProgress(
+      files: <File>[file],
+      permanent: permanent,
+      folderId: folderId,
+      folderPassword: folderPassword,
     );
-    if (result == null) {
-      return false;
-    }
-
-    await refreshFiles();
-    return true;
   }
 
   Future<bool> uploadFileWithProgress({
@@ -635,35 +741,198 @@ class FileManagerController extends ChangeNotifier {
     TransferProgressCallback? onProgress,
     TransferCancellationToken? cancelToken,
   }) async {
+    return uploadFilesWithProgress(
+      files: <File>[file],
+      permanent: permanent,
+      folderId: folderId,
+      folderPassword: folderPassword,
+      cancelToken: cancelToken,
+      onBatchProgress: (progress) {
+        onProgress?.call(progress.transferredBytes, progress.totalBytes);
+      },
+    );
+  }
+
+  Future<bool> uploadFilesWithProgress({
+    required List<File> files,
+    required bool permanent,
+    String? folderId,
+    String? folderPassword,
+    TransferCancellationToken? cancelToken,
+    BatchTransferProgressCallback? onBatchProgress,
+  }) async {
+    final result = await uploadFileSystemEntitiesWithProgress(
+      entities: files,
+      permanent: permanent,
+      folderId: folderId,
+      folderPassword: folderPassword,
+      cancelToken: cancelToken,
+      onBatchProgress: onBatchProgress,
+    );
+    return result.success;
+  }
+
+  Future<BatchUploadResult> uploadFileSystemEntitiesWithProgress({
+    required List<FileSystemEntity> entities,
+    required bool permanent,
+    String? folderId,
+    String? folderPassword,
+    FolderPasswordResolver? resolveFolderPassword,
+    TransferCancellationToken? cancelToken,
+    BatchTransferProgressCallback? onBatchProgress,
+  }) async {
+    final normalizedEntries = await _normalizeUploadEntities(entities);
+    if (normalizedEntries.isEmpty) {
+      _appendLog('上传失败: 未选择有效的文件或文件夹');
+      notifyListeners();
+      return const BatchUploadResult(
+        totalItems: 0,
+        succeededItems: 0,
+        failedItems: 0,
+        failures: <BatchTransferFailure>[],
+      );
+    }
+
     final effectiveFolderId = folderId ?? _currentFolderId;
     final effectiveFolderPassword =
         folderPassword ?? unlockedFolderPassword(effectiveFolderId);
-    final result = await _runTransferAction<Map<String, dynamic>>(
-      permanent ? '上传' : '临时上传',
-      () => permanent
-          ? _client.uploadPermanent(
-              file: file,
-              publicKeyPem: _requirePublicKey(_publicKeyPem),
-              folderId: effectiveFolderId,
-              folderPassword: effectiveFolderPassword,
-              onProgress: onProgress,
-              cancelToken: cancelToken,
-            )
-          : _client.uploadTemporary(
-              file,
-              publicKeyPem: _publicKeyPem,
-              folderId: effectiveFolderId,
-              folderPassword: effectiveFolderPassword,
-              onProgress: onProgress,
-              cancelToken: cancelToken,
-            ),
-    );
-    if (result == null) {
-      return false;
+    late final _PreparedUploadSelection prepared;
+    try {
+      prepared = await _prepareUploadSelection(
+        entities: normalizedEntries,
+        baseFolderId: effectiveFolderId,
+        baseFolderPassword: effectiveFolderPassword,
+        resolveFolderPassword: resolveFolderPassword,
+      );
+    } on StateError catch (error) {
+      _appendLog('上传失败: ${error.message}');
+      notifyListeners();
+      return BatchUploadResult(
+        totalItems: normalizedEntries.length,
+        succeededItems: 0,
+        failedItems: normalizedEntries.length,
+        failures: <BatchTransferFailure>[
+          BatchTransferFailure(
+            type: BatchTransferFailureType.serverRejected,
+            label: '准备上传内容',
+            error: error.message.toString(),
+          ),
+        ],
+      );
     }
 
-    await refreshFiles();
-    return true;
+    for (final entry in prepared.resolvedFolderPasswords.entries) {
+      unlockFolder(entry.key, entry.value);
+    }
+
+    if (prepared.files.isEmpty) {
+      _appendLog('上传完成: 已同步空文件夹结构');
+      await refreshWorkspace();
+      return const BatchUploadResult(
+        totalItems: 0,
+        succeededItems: 0,
+        failedItems: 0,
+        failures: <BatchTransferFailure>[],
+      );
+    }
+
+    onBatchProgress?.call(
+      BatchTransferProgress(
+        currentItemLabel: prepared.files.first.displayLabel,
+        completedItems: 0,
+        succeededItems: 0,
+        failedItems: 0,
+        totalItems: prepared.files.length,
+        transferredBytes: 0,
+        totalBytes: prepared.totalBytes,
+        statusText: '准备上传，共 ${prepared.files.length} 项',
+      ),
+    );
+
+    final result = await _runTransferAction<BatchUploadResult>(
+      permanent ? '批量上传' : '批量临时上传',
+      () async {
+        var completedItems = 0;
+        var completedBytes = 0;
+        var succeededItems = 0;
+        final failures = <BatchTransferFailure>[];
+        for (final file in prepared.files) {
+          if (cancelToken?.isCancelled ?? false) {
+            throw const TransferCancelledException('上传');
+          }
+          try {
+            await _uploadPreparedFile(
+              file,
+              permanent: permanent,
+              cancelToken: cancelToken,
+              onProgress: (transferredBytes, totalBytesIgnored) {
+                onBatchProgress?.call(
+                  BatchTransferProgress(
+                    currentItemLabel: file.displayLabel,
+                    completedItems: completedItems,
+                    succeededItems: succeededItems,
+                    failedItems: failures.length,
+                    totalItems: prepared.files.length,
+                    transferredBytes: completedBytes + transferredBytes,
+                    totalBytes: prepared.totalBytes,
+                    statusText:
+                        '正在上传第 ${completedItems + 1} / ${prepared.files.length} 项，已成功 $succeededItems 项，失败 ${failures.length} 项',
+                  ),
+                );
+                if (totalBytesIgnored == null) {
+                  return;
+                }
+              },
+            );
+            succeededItems += 1;
+          } catch (error) {
+            final message = error is StateError
+                ? error.message.toString()
+                : error.toString();
+            failures.add(
+              BatchTransferFailure(
+                type: _classifyBatchUploadFailure(error),
+                label: file.displayLabel,
+                error: _normalizeBatchUploadFailureMessage(error),
+              ),
+            );
+            _appendLog('上传失败: ${file.displayLabel} -> $message');
+          }
+          completedItems += 1;
+          completedBytes += file.size;
+          onBatchProgress?.call(
+            BatchTransferProgress(
+              currentItemLabel: file.displayLabel,
+              completedItems: completedItems,
+              succeededItems: succeededItems,
+              failedItems: failures.length,
+              totalItems: prepared.files.length,
+              transferredBytes: completedBytes,
+              totalBytes: prepared.totalBytes,
+              statusText:
+                  '已处理 $completedItems / ${prepared.files.length} 项，成功 $succeededItems 项，失败 ${failures.length} 项',
+            ),
+          );
+        }
+        return BatchUploadResult(
+          totalItems: prepared.files.length,
+          succeededItems: succeededItems,
+          failedItems: failures.length,
+          failures: List<BatchTransferFailure>.unmodifiable(failures),
+        );
+      },
+    );
+    if (result == null) {
+      return BatchUploadResult(
+        totalItems: prepared.files.length,
+        succeededItems: 0,
+        failedItems: prepared.files.length,
+        failures: const <BatchTransferFailure>[],
+      );
+    }
+
+    await refreshWorkspace();
+    return result;
   }
 
   Future<bool> renameFile({
@@ -807,6 +1076,57 @@ class FileManagerController extends ChangeNotifier {
     return savedFile;
   }
 
+  Future<File?> downloadFolderArchiveToConfiguredDirectoryWithProgress(
+    IndexedFolder folder, {
+    Map<String, String> folderPasswords = const <String, String>{},
+    TransferProgressCallback? onProgress,
+    TransferCancellationToken? cancelToken,
+  }) async {
+    if (!hasDownloadDirectory) {
+      _appendLog('下载失败: 未设置固定下载目录');
+      notifyListeners();
+      return null;
+    }
+
+    final saveFile = await _resolveUniqueNamedFile(
+      directoryPath: _downloadDirectory,
+      fileName: '${folder.name}.zip',
+    );
+    final mergedPasswords = <String, String>{};
+    for (final entry in _unlockedFolderPasswords.entries) {
+      if (entry.key.trim().isEmpty || entry.value.trim().isEmpty) {
+        continue;
+      }
+      mergedPasswords[entry.key] = entry.value;
+    }
+    for (final entry in folderPasswords.entries) {
+      final folderId = entry.key.trim();
+      final password = entry.value.trim();
+      if (folderId.isEmpty || password.isEmpty) {
+        continue;
+      }
+      mergedPasswords[folderId] = password;
+      unlockFolder(folderId, password);
+    }
+
+    final savedFile = await _runTransferAction<File>('下载文件夹压缩包', () async {
+      return _client.downloadFolderArchiveToFile(
+        publicKeyPem: _requirePublicKey(_publicKeyPem),
+        folderId: folder.id,
+        folderPasswords: mergedPasswords,
+        savePath: saveFile.path,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+      );
+    });
+
+    if (savedFile != null) {
+      _appendLog('文件夹压缩包已保存到: ${savedFile.path}');
+      notifyListeners();
+    }
+    return savedFile;
+  }
+
   Future<void> refreshCacheSize() async {
     if (_cacheBusy) {
       return;
@@ -869,6 +1189,8 @@ class FileManagerController extends ChangeNotifier {
     _previewFile = file;
     _previewError = null;
     _previewImageBytes = null;
+    _previewTransferredBytes = 0;
+    _previewTotalBytes = null;
 
     if (!file.mimeType.startsWith('image/')) {
       _previewLoading = false;
@@ -880,19 +1202,31 @@ class FileManagerController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final bytes = await _client.downloadBytes(file.path);
+      final bytes = await _client.downloadBytesWithProgress(
+        file.path,
+        onProgress: (transferredBytes, totalBytes) {
+          if (_previewFile?.path != file.path) {
+            return;
+          }
+          _previewTransferredBytes = transferredBytes;
+          _previewTotalBytes = totalBytes;
+          notifyListeners();
+        },
+      );
       if (_previewFile?.path != file.path) {
         return;
       }
       _previewImageBytes = bytes;
+      _previewTransferredBytes = bytes.length;
+      _previewTotalBytes ??= bytes.length;
       _appendLog(
-        '已加载预览: ${file.indexedName.isEmpty ? file.systemName : file.indexedName}',
+        '已加载图片: ${file.indexedName.isEmpty ? file.systemName : file.indexedName}',
       );
     } catch (error) {
       if (_previewFile?.path != file.path) {
         return;
       }
-      _previewError = '预览加载失败: $error';
+      _previewError = '图片加载失败: $error';
       _appendLog(_previewError!);
     } finally {
       if (_previewFile?.path == file.path) {
@@ -1390,6 +1724,350 @@ class FileManagerController extends ChangeNotifier {
     return mapped.values.toList(growable: false);
   }
 
+  int _compareFolderPath(IndexedFolder left, IndexedFolder right) {
+    return left.path.toLowerCase().compareTo(right.path.toLowerCase());
+  }
+
+  Future<List<FileSystemEntity>> _normalizeUploadEntities(
+    List<FileSystemEntity> entities,
+  ) async {
+    final deduplicated = <String, FileSystemEntity>{};
+    for (final entity in entities) {
+      final normalizedPath = entity.path.trim();
+      if (normalizedPath.isEmpty) {
+        continue;
+      }
+      final entityType = await FileSystemEntity.type(normalizedPath);
+      if (entityType == FileSystemEntityType.notFound) {
+        continue;
+      }
+      if (entityType == FileSystemEntityType.file) {
+        deduplicated[normalizedPath] = File(normalizedPath);
+      } else if (entityType == FileSystemEntityType.directory) {
+        deduplicated[normalizedPath] = Directory(normalizedPath);
+      }
+    }
+
+    final result = deduplicated.values.toList(growable: false)
+      ..sort(
+        (left, right) =>
+            left.path.toLowerCase().compareTo(right.path.toLowerCase()),
+      );
+    return result;
+  }
+
+  Future<_PreparedUploadSelection> _prepareUploadSelection({
+    required List<FileSystemEntity> entities,
+    required String? baseFolderId,
+    required String? baseFolderPassword,
+    required FolderPasswordResolver? resolveFolderPassword,
+  }) async {
+    final foldersByParentAndName = <String, IndexedFolder>{};
+    for (final folder in _folders) {
+      foldersByParentAndName[_folderLookupKey(folder.parentId, folder.name)] =
+          folder;
+    }
+
+    final resolvedPasswords = <String, String>{
+      for (final entry in _unlockedFolderPasswords.entries)
+        if (entry.key.trim().isNotEmpty && entry.value.trim().isNotEmpty)
+          entry.key.trim(): entry.value.trim(),
+    };
+    final normalizedBasePassword = baseFolderPassword?.trim() ?? '';
+    if ((baseFolderId?.trim().isNotEmpty ?? false) &&
+        normalizedBasePassword.isNotEmpty) {
+      resolvedPasswords[baseFolderId!.trim()] = normalizedBasePassword;
+    }
+
+    final preparedFiles = <_PreparedUploadFile>[];
+    for (final entity in entities) {
+      if (entity is File) {
+        preparedFiles.add(
+          _PreparedUploadFile(
+            file: entity,
+            targetFolderId: baseFolderId,
+            targetFolderPassword: normalizedBasePassword.isEmpty
+                ? resolvedPasswords[baseFolderId?.trim() ?? '']
+                : normalizedBasePassword,
+            displayLabel: p.basename(entity.path),
+            size: await entity.length(),
+          ),
+        );
+        continue;
+      }
+
+      if (entity is! Directory) {
+        continue;
+      }
+
+      await _collectDirectoryUploadFiles(
+        directory: entity,
+        relativePrefix: p.basename(entity.path),
+        targetParentId: baseFolderId,
+        targetParentPassword: normalizedBasePassword.isEmpty
+            ? resolvedPasswords[baseFolderId?.trim() ?? '']
+            : normalizedBasePassword,
+        foldersByParentAndName: foldersByParentAndName,
+        resolvedPasswords: resolvedPasswords,
+        resolveFolderPassword: resolveFolderPassword,
+        preparedFiles: preparedFiles,
+      );
+    }
+
+    return _PreparedUploadSelection(
+      files: preparedFiles,
+      resolvedFolderPasswords: resolvedPasswords,
+      totalBytes: preparedFiles.fold<int>(
+        0,
+        (int sum, _PreparedUploadFile item) => sum + item.size,
+      ),
+    );
+  }
+
+  Future<void> _collectDirectoryUploadFiles({
+    required Directory directory,
+    required String relativePrefix,
+    required String? targetParentId,
+    required String? targetParentPassword,
+    required Map<String, IndexedFolder> foldersByParentAndName,
+    required Map<String, String> resolvedPasswords,
+    required FolderPasswordResolver? resolveFolderPassword,
+    required List<_PreparedUploadFile> preparedFiles,
+  }) async {
+    final resolvedTargetFolder = await _resolveUploadTargetFolder(
+      name: p.basename(directory.path),
+      parentId: targetParentId,
+      parentPassword: targetParentPassword,
+      foldersByParentAndName: foldersByParentAndName,
+      resolvedPasswords: resolvedPasswords,
+      resolveFolderPassword: resolveFolderPassword,
+    );
+
+    final children = await directory
+        .list(recursive: false, followLinks: false)
+        .toList();
+    children.sort(
+      (left, right) =>
+          left.path.toLowerCase().compareTo(right.path.toLowerCase()),
+    );
+
+    for (final child in children) {
+      if (child is File) {
+        preparedFiles.add(
+          _PreparedUploadFile(
+            file: child,
+            targetFolderId: resolvedTargetFolder.folder.id,
+            targetFolderPassword: resolvedTargetFolder.folderPassword,
+            displayLabel: p.join(relativePrefix, p.basename(child.path)),
+            size: await child.length(),
+          ),
+        );
+        continue;
+      }
+
+      if (child is! Directory) {
+        continue;
+      }
+
+      await _collectDirectoryUploadFiles(
+        directory: child,
+        relativePrefix: p.join(relativePrefix, p.basename(child.path)),
+        targetParentId: resolvedTargetFolder.folder.id,
+        targetParentPassword: resolvedTargetFolder.folderPassword,
+        foldersByParentAndName: foldersByParentAndName,
+        resolvedPasswords: resolvedPasswords,
+        resolveFolderPassword: resolveFolderPassword,
+        preparedFiles: preparedFiles,
+      );
+    }
+  }
+
+  Future<_ResolvedUploadFolder> _resolveUploadTargetFolder({
+    required String name,
+    required String? parentId,
+    required String? parentPassword,
+    required Map<String, IndexedFolder> foldersByParentAndName,
+    required Map<String, String> resolvedPasswords,
+    required FolderPasswordResolver? resolveFolderPassword,
+  }) async {
+    final lookupKey = _folderLookupKey(parentId, name);
+    final existingFolder = foldersByParentAndName[lookupKey];
+    if (existingFolder != null) {
+      final folderPassword = await _resolveEncryptedFolderPassword(
+        folder: existingFolder,
+        resolvedPasswords: resolvedPasswords,
+        resolveFolderPassword: resolveFolderPassword,
+      );
+      return _ResolvedUploadFolder(
+        folder: existingFolder,
+        folderPassword: folderPassword,
+      );
+    }
+
+    final response = await _client.createFolder(
+      publicKeyPem: _requirePublicKey(_publicKeyPem),
+      name: name,
+      parentId: parentId,
+      encrypted: false,
+      allowDirectDownload: false,
+      parentFolderPassword: parentPassword,
+    );
+    final data = Map<String, dynamic>.from(
+      response['data'] as Map<String, dynamic>? ?? <String, dynamic>{},
+    );
+    final createdFolder = IndexedFolder.fromJson(data);
+    foldersByParentAndName[
+          _folderLookupKey(createdFolder.parentId, createdFolder.name)
+        ] = createdFolder;
+    return _ResolvedUploadFolder(folder: createdFolder, folderPassword: null);
+  }
+
+  Future<String?> _resolveEncryptedFolderPassword({
+    required IndexedFolder folder,
+    required Map<String, String> resolvedPasswords,
+    required FolderPasswordResolver? resolveFolderPassword,
+  }) async {
+    if (!folder.encrypted) {
+      return null;
+    }
+
+    final cachedPassword = resolvedPasswords[folder.id]?.trim() ?? '';
+    if (cachedPassword.isNotEmpty) {
+      return cachedPassword;
+    }
+    if (resolveFolderPassword == null) {
+      throw StateError('缺少加密文件夹密码: ${folder.path}');
+    }
+
+    final password = await resolveFolderPassword(folder, '合并上传到该目录');
+    final normalizedPassword = password?.trim() ?? '';
+    if (normalizedPassword.isEmpty) {
+      throw StateError('缺少加密文件夹密码: ${folder.path}');
+    }
+    resolvedPasswords[folder.id] = normalizedPassword;
+    return normalizedPassword;
+  }
+
+  Future<void> _uploadPreparedFile(
+    _PreparedUploadFile file, {
+    required bool permanent,
+    required TransferCancellationToken? cancelToken,
+    required TransferProgressCallback onProgress,
+  }) async {
+    if (permanent) {
+      await _client.uploadPermanent(
+        file: file.file,
+        publicKeyPem: _requirePublicKey(_publicKeyPem),
+        folderId: file.targetFolderId,
+        folderPassword: file.targetFolderPassword,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+      );
+      return;
+    }
+
+    await _client.uploadTemporary(
+      file.file,
+      publicKeyPem: _publicKeyPem,
+      folderId: file.targetFolderId,
+      folderPassword: file.targetFolderPassword,
+      onProgress: onProgress,
+      cancelToken: cancelToken,
+    );
+  }
+
+  String _folderLookupKey(String? parentId, String name) {
+    final normalizedParentId = parentId?.trim() ?? '';
+    return '${normalizedParentId.toLowerCase()}::${name.trim().toLowerCase()}';
+  }
+
+  BatchTransferFailureType _classifyBatchUploadFailure(Object error) {
+    if (error is SocketException) {
+      return BatchTransferFailureType.network;
+    }
+    final rawMessage = error is StateError
+        ? error.message.toString()
+        : error.toString();
+    final message = rawMessage.toLowerCase();
+
+    if (message.contains('40302') ||
+        message.contains('40105') ||
+        message.contains('40107') ||
+        message.contains('folder password') ||
+        message.contains('密码')) {
+      return BatchTransferFailureType.password;
+    }
+
+    if (message.contains('socketexception') ||
+        message.contains('connection reset') ||
+        message.contains('connection closed') ||
+        message.contains('connection aborted') ||
+        message.contains('unexpected response') ||
+        message.contains('timed out') ||
+        message.contains('failed host lookup') ||
+        message.contains('network is unreachable')) {
+      return BatchTransferFailureType.network;
+    }
+
+    return BatchTransferFailureType.serverRejected;
+  }
+
+  String _normalizeBatchUploadFailureMessage(Object error) {
+    if (error is SocketException) {
+      return '上传过程中网络连接中断，请检查网络或稍后重试。';
+    }
+
+    final rawMessage = error is StateError
+        ? error.message.toString()
+        : error.toString();
+    final message = rawMessage.toLowerCase();
+
+    if (message.contains('40302') ||
+        message.contains('invalid folder password')) {
+      return '目标加密文件夹密码错误，请重新验证后再试。';
+    }
+    if (message.contains('40105') ||
+        message.contains('40107') ||
+        message.contains('missing folder password') ||
+        message.contains('missing folder passwords token')) {
+      return '缺少加密文件夹密码验证，请补全相关密码后重试。';
+    }
+    if (message.contains('续传会话失效')) {
+      return '上传会话已失效，需要重新开始该项上传。';
+    }
+    if (message.contains('41301') ||
+        message.contains('file too large') ||
+        message.contains('上传分片过大')) {
+      return '文件体积或分片大小超出服务端限制，请调整后重试。';
+    }
+    if (message.contains('42900') || message.contains('too many upload requests')) {
+      return '上传请求过于频繁，已被服务端限流，请稍后重试。';
+    }
+    if (message.contains('40403') || message.contains('folder not found')) {
+      return '目标文件夹不存在，目录结构可能已发生变化，请刷新后重试。';
+    }
+    if (message.contains('40103') ||
+        message.contains('40100') ||
+        message.contains('40101') ||
+        message.contains('40102') ||
+        message.contains('missing management token') ||
+        message.contains('invalid token') ||
+        message.contains('expired permanent token') ||
+        message.contains('replayed permanent token')) {
+      return '鉴权令牌无效或已过期，服务端拒绝了此次上传请求。';
+    }
+    if (message.contains('500') ||
+        message.contains('internal server error') ||
+        message.contains('verification is unavailable') ||
+        message.contains('服务端未返回合法 json')) {
+      return '服务端处理上传请求时发生异常，请稍后重试或检查服务端日志。';
+    }
+    if (_classifyBatchUploadFailure(error) == BatchTransferFailureType.network) {
+      return '上传过程中网络连接异常，请检查网络后重试。';
+    }
+    return '服务端拒绝了该项上传，请查看操作日志中的原始错误信息。';
+  }
+
   void _syncPreviewFile() {
     final preview = _previewFile;
     if (preview == null) {
@@ -1409,6 +2087,8 @@ class FileManagerController extends ChangeNotifier {
       _previewImageBytes = null;
       _previewError = null;
       _previewLoading = false;
+      _previewTransferredBytes = 0;
+      _previewTotalBytes = null;
       return;
     }
 
@@ -1469,6 +2149,26 @@ class FileManagerController extends ChangeNotifier {
     return candidate;
   }
 
+  Future<File> _resolveUniqueNamedFile({
+    required String directoryPath,
+    required String fileName,
+  }) async {
+    final rawName = fileName.split(RegExp(r'[\\/]')).last.trim();
+    final safeName = rawName.isEmpty ? 'downloaded_file' : rawName;
+    final dotIndex = safeName.lastIndexOf('.');
+    final hasExtension = dotIndex > 0 && dotIndex < safeName.length - 1;
+    final baseName = hasExtension ? safeName.substring(0, dotIndex) : safeName;
+    final extension = hasExtension ? safeName.substring(dotIndex) : '';
+
+    var candidate = File('$directoryPath/$safeName');
+    var index = 1;
+    while (await candidate.exists()) {
+      candidate = File('$directoryPath/$baseName ($index)$extension');
+      index += 1;
+    }
+    return candidate;
+  }
+
   String _formatBytes(int bytes) {
     if (bytes < 1024) {
       return '$bytes B';
@@ -1514,7 +2214,6 @@ class FileManagerController extends ChangeNotifier {
     }
     return null;
   }
-
   List<BaseUrlPreset> _decodeBaseUrlPresets(String? rawJson) {
     if (rawJson == null || rawJson.trim().isEmpty) {
       return const <BaseUrlPreset>[];
@@ -1632,6 +2331,8 @@ class FileManagerController extends ChangeNotifier {
     _previewImageBytes = null;
     _previewError = null;
     _previewLoading = false;
+    _previewTransferredBytes = 0;
+    _previewTotalBytes = null;
   }
 
   @override
@@ -1639,4 +2340,42 @@ class FileManagerController extends ChangeNotifier {
     _client.close();
     super.dispose();
   }
+}
+
+class _ResolvedUploadFolder {
+  const _ResolvedUploadFolder({
+    required this.folder,
+    required this.folderPassword,
+  });
+
+  final IndexedFolder folder;
+  final String? folderPassword;
+}
+
+class _PreparedUploadFile {
+  const _PreparedUploadFile({
+    required this.file,
+    required this.targetFolderId,
+    required this.targetFolderPassword,
+    required this.displayLabel,
+    required this.size,
+  });
+
+  final File file;
+  final String? targetFolderId;
+  final String? targetFolderPassword;
+  final String displayLabel;
+  final int size;
+}
+
+class _PreparedUploadSelection {
+  const _PreparedUploadSelection({
+    required this.files,
+    required this.resolvedFolderPasswords,
+    required this.totalBytes,
+  });
+
+  final List<_PreparedUploadFile> files;
+  final Map<String, String> resolvedFolderPasswords;
+  final int totalBytes;
 }

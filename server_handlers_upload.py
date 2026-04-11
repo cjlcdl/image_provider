@@ -106,7 +106,7 @@ class UploadHandlerMixin:
         total_size = payload.get("size")
         if isinstance(total_size, str) and total_size.isdigit():
             total_size = int(total_size)
-        if not isinstance(total_size, int) or total_size <= 0:
+        if not isinstance(total_size, int) or total_size < 0:
             self.send_error_json(HTTPStatus.BAD_REQUEST, 40024, "invalid upload size")
             return
         if total_size > MAX_UPLOAD_BYTES:
@@ -341,7 +341,9 @@ class UploadHandlerMixin:
         storage_type, target_path, normalized_path = resolved
         target_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = upload_session_part_path(upload_id)
-        if not part_path.exists() or part_path.stat().st_size < total_size:
+        if total_size == 0:
+            target_path.touch(exist_ok=True)
+        elif not part_path.exists() or part_path.stat().st_size < total_size:
             self.send_json(
                 HTTPStatus.CONFLICT,
                 {
@@ -354,8 +356,8 @@ class UploadHandlerMixin:
                 },
             )
             return
-
-        shutil.move(str(part_path), str(target_path))
+        else:
+            shutil.move(str(part_path), str(target_path))
         upsert_file_index_record(
             storage_type=storage_type,
             relative_path=normalized_path,
@@ -557,12 +559,6 @@ class UploadHandlerMixin:
             return
         except OSError:
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, 50000, "internal server error")
-            return
-
-        if file_size <= 0:
-            if saved_path.exists():
-                saved_path.unlink()
-            self.send_error_json(HTTPStatus.BAD_REQUEST, 40012, "uploaded file is empty")
             return
 
         mime_type = mimetypes.guess_type(saved_path.name)[0] or "application/octet-stream"

@@ -64,6 +64,7 @@ class ImageBedClient {
   static const String folderPasswordTokenHeader = 'Folder-Password-Token';
   static const String targetFolderPasswordTokenHeader =
       'Target-Folder-Password-Token';
+  static const String folderPasswordsTokenHeader = 'Folder-Passwords-Token';
   static const int _defaultResumableChunkSize = 4 * 1024 * 1024;
   static const int _minimumResumableChunkSize = 256 * 1024;
   static const String _resumableUploadStateDirectory = 'resumable_uploads';
@@ -383,6 +384,120 @@ class ImageBedClient {
     return _decodeJsonResponse(response);
   }
 
+  Future<File> downloadFolderArchiveToFile({
+    required String publicKeyPem,
+    required String folderId,
+    required Map<String, String> folderPasswords,
+    required String savePath,
+    TransferProgressCallback? onProgress,
+    TransferCancellationToken? cancelToken,
+  }) async {
+    final targetFile = File(savePath);
+    await targetFile.parent.create(recursive: true);
+
+    final partialFile = File('$savePath.part');
+    if (await partialFile.exists()) {
+      await partialFile.delete();
+    }
+
+    final httpClient = HttpClient();
+    void abortRequest() {
+      httpClient.close(force: true);
+    }
+
+    cancelToken?.addListener(abortRequest);
+    try {
+      final request = await httpClient.postUrl(_buildUri('/api/folders/archive'));
+      _applyHeaders(
+        request.headers,
+        _buildRequestHeaders(
+          _mergeHeaders(
+            _buildManagementHeaders(publicKeyPem: publicKeyPem),
+            _buildFolderPasswordsHeaders(
+              publicKeyPem: publicKeyPem,
+              folderPasswords: folderPasswords,
+            ),
+          ),
+        ),
+      );
+      request.headers.set(
+        HttpHeaders.contentTypeHeader,
+        'application/json; charset=utf-8',
+      );
+
+      final bodyBytes = Uint8List.fromList(
+        utf8.encode(jsonEncode(<String, dynamic>{'folderId': folderId})),
+      );
+      request.headers.contentLength = bodyBytes.length;
+      request.add(bodyBytes);
+
+      final response = await request.close();
+      if (response.statusCode >= 400) {
+        final bytes = await _collectResponseBytes(response);
+        final errorBody = _decodeJsonBytes(
+          response.statusCode,
+          bytes,
+          allowErrorStatus: true,
+        );
+        throw HttpException(
+          '下载失败: ${response.statusCode}, ${jsonEncode(errorBody)}',
+        );
+      }
+
+      final totalBytes = response.contentLength >= 0
+          ? response.contentLength
+          : null;
+      onProgress?.call(0, totalBytes);
+
+      final sink = partialFile.openWrite(mode: FileMode.writeOnly);
+      var transferredBytes = 0;
+      try {
+        await for (final chunk in response) {
+          if (cancelToken?.isCancelled ?? false) {
+            throw const TransferCancelledException('下载');
+          }
+          sink.add(chunk);
+          transferredBytes += chunk.length;
+          onProgress?.call(transferredBytes, totalBytes);
+        }
+      } finally {
+        await sink.flush();
+        await sink.close();
+      }
+
+      if (cancelToken?.isCancelled ?? false) {
+        throw const TransferCancelledException('下载');
+      }
+
+      if (await targetFile.exists()) {
+        await targetFile.delete();
+      }
+      await partialFile.rename(targetFile.path);
+      return targetFile;
+    } on TransferCancelledException {
+      if (await partialFile.exists()) {
+        await partialFile.delete();
+      }
+      rethrow;
+    } on HttpException {
+      if (await partialFile.exists()) {
+        await partialFile.delete();
+      }
+      rethrow;
+    } on SocketException {
+      if (await partialFile.exists()) {
+        await partialFile.delete();
+      }
+      if (cancelToken?.isCancelled ?? false) {
+        throw const TransferCancelledException('下载');
+      }
+      rethrow;
+    } finally {
+      cancelToken?.removeListener(abortRequest);
+      httpClient.close(force: true);
+    }
+  }
+
   Future<Map<String, dynamic>> renameIndexedName({
     required String relativePath,
     required String indexedName,
@@ -627,6 +742,43 @@ class ImageBedClient {
     return response.bodyBytes;
   }
 
+  Future<Uint8List> downloadBytesWithProgress(
+    String relativePath, {
+    TransferProgressCallback? onProgress,
+  }) async {
+    final httpClient = HttpClient();
+    try {
+      final request = await httpClient.getUrl(_buildUri(relativePath));
+      _applyHeaders(request.headers, _buildRequestHeaders());
+
+      final response = await request.close();
+      if (response.statusCode >= 400) {
+        final bytes = await _collectResponseBytes(response);
+        final errorBody = _tryDecodeJson(bytes);
+        throw HttpException(
+          '下载失败: ${response.statusCode}, ${jsonEncode(errorBody ?? utf8.decode(bytes, allowMalformed: true))}',
+        );
+      }
+
+      final totalBytes = response.contentLength >= 0
+          ? response.contentLength
+          : null;
+      var transferredBytes = 0;
+      final builder = BytesBuilder(copy: false);
+      onProgress?.call(transferredBytes, totalBytes);
+
+      await for (final chunk in response) {
+        builder.add(chunk);
+        transferredBytes += chunk.length;
+        onProgress?.call(transferredBytes, totalBytes);
+      }
+
+      return builder.takeBytes();
+    } finally {
+      httpClient.close(force: true);
+    }
+  }
+
   String buildPermanentToken({
     required String publicKeyPem,
     String? nonce,
@@ -655,6 +807,37 @@ class ImageBedClient {
         'nonce': nonce ?? _generateNonce(),
         'folderId': folderId,
         'password': password,
+      },
+    );
+  }
+
+  String buildFolderPasswordsToken({
+    required String publicKeyPem,
+    required Map<String, String> folderPasswords,
+    String? nonce,
+    int? timestamp,
+  }) {
+    final entries = folderPasswords.entries
+        .where(
+          (entry) => entry.key.trim().isNotEmpty && entry.value.trim().isNotEmpty,
+        )
+        .map(
+          (entry) => <String, String>{
+            'folderId': entry.key.trim(),
+            'password': entry.value.trim(),
+          },
+        )
+        .toList(growable: false)
+      ..sort(
+        (left, right) =>
+            (left['folderId'] ?? '').compareTo(right['folderId'] ?? ''),
+      );
+    return buildEncryptedPayloadToken(
+      publicKeyPem: publicKeyPem,
+      payload: <String, dynamic>{
+        'ts': timestamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        'nonce': nonce ?? _generateNonce(),
+        'folders': entries,
       },
     );
   }
@@ -724,6 +907,30 @@ class ImageBedClient {
         publicKeyPem: publicKeyPem,
         folderId: normalizedFolderId,
         password: normalizedPassword,
+      ),
+    };
+  }
+
+  Map<String, String> _buildFolderPasswordsHeaders({
+    required String publicKeyPem,
+    required Map<String, String> folderPasswords,
+  }) {
+    final normalized = <String, String>{};
+    for (final entry in folderPasswords.entries) {
+      final folderId = entry.key.trim();
+      final password = entry.value.trim();
+      if (folderId.isEmpty || password.isEmpty) {
+        continue;
+      }
+      normalized[folderId] = password;
+    }
+    if (normalized.isEmpty) {
+      return const <String, String>{};
+    }
+    return <String, String>{
+      folderPasswordsTokenHeader: buildFolderPasswordsToken(
+        publicKeyPem: publicKeyPem,
+        folderPasswords: normalized,
       ),
     };
   }

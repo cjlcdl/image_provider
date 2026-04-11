@@ -10,6 +10,8 @@ import 'package:courage_storage/services/storage_permission_service.dart';
 import 'package:courage_storage/widgets/managed_file_tile.dart';
 import 'package:courage_storage/widgets/panel_card.dart';
 import 'package:courage_storage/widgets/transfer_progress_dialog.dart';
+import 'package:cross_file/cross_file.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,6 +38,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
 
   int _currentIndex = 0;
   bool _batchMode = false;
+  bool _draggingUpload = false;
   String _storageFilter = '';
 
   String _normalizedFileLabel(ManagedFile file) {
@@ -389,7 +392,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
                             children: <Widget>[
                               Expanded(
                                 child: Text(
-                                  '预览',
+                                  '文件信息',
                                   style: Theme.of(context).textTheme.titleLarge,
                                 ),
                               ),
@@ -823,7 +826,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
               const SizedBox(height: 12),
               FilledButton(
                 onPressed: onLoadPressed,
-                child: const Text('加载预览图'),
+                child: const Text('加载图片'),
               ),
             ],
           ),
@@ -1001,6 +1004,97 @@ class _FileManagerPageState extends State<FileManagerPage> {
       passwords[folder.id] = normalizedPassword;
     }
     return passwords;
+  }
+
+  bool get _supportsDesktopDrop =>
+      Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+
+  Future<List<FileSystemEntity>> _pickUploadEntities({
+    required bool pickDirectory,
+  }) async {
+    if (pickDirectory) {
+      final directoryPath = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: '选择要上传的文件夹',
+      );
+      if (directoryPath == null || directoryPath.trim().isEmpty) {
+        return const <FileSystemEntity>[];
+      }
+      return <FileSystemEntity>[Directory(directoryPath)];
+    }
+
+    final picked = await FilePicker.platform.pickFiles(
+      withData: false,
+      allowMultiple: true,
+    );
+    if (picked == null || picked.files.isEmpty) {
+      return const <FileSystemEntity>[];
+    }
+    return picked.files
+        .map((item) => item.path)
+        .whereType<String>()
+        .where((path) => path.trim().isNotEmpty)
+        .map<FileSystemEntity>((path) => File(path))
+        .toList(growable: false);
+  }
+
+  Future<List<FileSystemEntity>> _normalizeDroppedEntities(
+    List<XFile> droppedFiles,
+  ) async {
+    final deduplicated = <String, FileSystemEntity>{};
+    for (final droppedFile in droppedFiles) {
+      final rawPath = droppedFile.path.trim();
+      if (rawPath.isEmpty) {
+        continue;
+      }
+      final entityType = await FileSystemEntity.type(rawPath);
+      if (entityType == FileSystemEntityType.file) {
+        deduplicated[rawPath] = File(rawPath);
+      } else if (entityType == FileSystemEntityType.directory) {
+        deduplicated[rawPath] = Directory(rawPath);
+      }
+    }
+    return deduplicated.values.toList(growable: false);
+  }
+
+  String _describeUploadSelection(List<FileSystemEntity> entries) {
+    if (entries.isEmpty) {
+      return '未选择内容';
+    }
+    if (entries.length == 1) {
+      return entries.first.path.split(RegExp(r'[\\/]')).last;
+    }
+    final fileCount = entries.whereType<File>().length;
+    final folderCount = entries.whereType<Directory>().length;
+    return '共选择 $fileCount 个文件、$folderCount 个文件夹';
+  }
+
+  Future<String?> _resolveUploadFolderPassword(
+    IndexedFolder folder,
+    String purpose,
+  ) async {
+    final cachedPassword = _controller.unlockedFolderPassword(folder.id);
+    if (cachedPassword != null && cachedPassword.isNotEmpty) {
+      return cachedPassword;
+    }
+    final password = await _promptPassword(
+      title: '验证文件夹密码',
+      description: '$purpose“${folder.name}”前需要输入该文件夹密码。',
+      confirmLabel: '验证',
+    );
+    if (password == null || password.trim().isEmpty) {
+      return null;
+    }
+    _controller.unlockFolder(folder.id, password.trim());
+    return password.trim();
+  }
+
+  Future<Map<String, String>?> _collectArchiveFolderPasswords(
+    IndexedFolder folder,
+  ) async {
+    return _collectFolderPasswords(
+      _controller.encryptedFoldersForArchive(folder.id),
+      purpose: '下载文件夹压缩包',
+    );
   }
 
   Future<void> _openFolder(String? folderId) async {
@@ -1420,27 +1514,31 @@ class _FileManagerPageState extends State<FileManagerPage> {
     );
   }
 
-  Future<void> _showUploadDialog() async {
+  Future<void> _showUploadDialog({
+    List<FileSystemEntity>? initialEntries,
+    bool pickDirectory = false,
+  }) async {
     final currentFolderId = _controller.currentFolderId;
     final currentFolder = _controller.folderById(currentFolderId);
     final currentFolderUnlocked = await _ensureFolderUnlocked(
       currentFolderId,
-      purpose: '上传文件到当前目录',
+      purpose: pickDirectory ? '上传文件夹到当前目录' : '上传文件到当前目录',
     );
     if (!mounted || !currentFolderUnlocked) {
       return;
     }
 
-    File? selectedFile;
+    var selectedEntries = initialEntries?.toList(growable: true) ??
+        <FileSystemEntity>[];
     var permanent = false;
 
-    final result = await showDialog<_UploadDialogResult>(
+    final uploadDialogResult = await showDialog<_UploadDialogResult>(
       context: context,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
-              title: const Text('上传文件'),
+              title: Text(pickDirectory ? '上传文件夹' : '上传文件'),
               content: SizedBox(
                 width: 420,
                 child: Column(
@@ -1449,32 +1547,71 @@ class _FileManagerPageState extends State<FileManagerPage> {
                   children: <Widget>[
                     FilledButton.tonalIcon(
                       onPressed: () async {
-                        final picked = await FilePicker.platform.pickFiles(
-                          withData: false,
+                        final picked = await _pickUploadEntities(
+                          pickDirectory: pickDirectory,
                         );
-                        if (picked == null ||
-                            picked.files.isEmpty ||
-                            picked.files.single.path == null) {
+                        if (picked.isEmpty) {
                           return;
                         }
                         setDialogState(() {
-                          selectedFile = File(picked.files.single.path!);
+                          selectedEntries = picked.toList(growable: true);
                         });
                       },
-                      icon: const Icon(Icons.attach_file_rounded),
-                      label: const Text('选择文件'),
+                      icon: Icon(
+                        pickDirectory
+                            ? Icons.drive_folder_upload_outlined
+                            : Icons.attach_file_rounded,
+                      ),
+                      label: Text(pickDirectory ? '选择文件夹' : '选择文件'),
                     ),
                     const SizedBox(height: 12),
                     Text(
-                      selectedFile == null
-                          ? '尚未选择文件'
-                          : selectedFile!.path.split(RegExp(r'[\\/]')).last,
+                      selectedEntries.isEmpty
+                          ? (pickDirectory ? '尚未选择文件夹' : '尚未选择文件')
+                          : _describeUploadSelection(selectedEntries),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
+                    if (selectedEntries.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 8),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 120),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: selectedEntries
+                                .take(5)
+                                .map(
+                                  (entry) => Text(
+                                    entry.path.split(RegExp(r'[\\/]')).last,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall,
+                                  ),
+                                )
+                                .toList(growable: false),
+                          ),
+                        ),
+                      ),
+                      if (selectedEntries.length > 5)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            '其余 ${selectedEntries.length - 5} 项将在上传时一并处理',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                    ],
                     const SizedBox(height: 16),
                     Text(
                       '上传到: ${_controller.currentFolderPathLabel}',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 8),
+                    if(pickDirectory)
+                      Text('将保留所选文件夹的完整目录结构；若遇到同名文件夹，会合并到现有目录。',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                     if (currentFolder?.encrypted == true) ...<Widget>[
@@ -1506,12 +1643,12 @@ class _FileManagerPageState extends State<FileManagerPage> {
                   child: const Text('取消'),
                 ),
                 FilledButton(
-                  onPressed: selectedFile == null
+                  onPressed: selectedEntries.isEmpty
                       ? null
                       : () {
                           Navigator.of(context).pop(
                             _UploadDialogResult(
-                              file: selectedFile!,
+                              entries: selectedEntries.toList(growable: false),
                               permanent: permanent,
                             ),
                           );
@@ -1525,7 +1662,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
       },
     );
 
-    if (result == null) {
+    if (uploadDialogResult == null) {
       return;
     }
 
@@ -1533,15 +1670,114 @@ class _FileManagerPageState extends State<FileManagerPage> {
       final folderPassword = currentFolder?.encrypted == true
           ? _controller.unlockedFolderPassword(currentFolderId)
           : null;
-      final success = await _runTransferWithDialog<bool>(
+      final uploadResult = await _runBatchTransferWithDialog<BatchUploadResult>(
         title: '上传中',
-        fileName: result.file.path.split(RegExp(r'[\\/]')).last,
+        initialFileName: _describeUploadSelection(uploadDialogResult.entries),
+        summaryText: '正在校验目录并准备上传',
         action: (onProgress, cancelToken) {
-          return _controller.uploadFileWithProgress(
-            file: result.file,
-            permanent: result.permanent,
+          return _controller.uploadFileSystemEntitiesWithProgress(
+            entities: uploadDialogResult.entries,
+            permanent: uploadDialogResult.permanent,
             folderId: currentFolderId,
             folderPassword: folderPassword,
+            cancelToken: cancelToken,
+            resolveFolderPassword: _resolveUploadFolderPassword,
+            onBatchProgress: onProgress,
+          );
+        },
+      );
+      if (!mounted) {
+        return;
+      }
+      if (uploadResult.success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              uploadResult.totalItems <= 1
+                  ? '上传完成，已成功处理 1 项'
+                  : '批量上传完成，已成功处理 ${uploadResult.succeededItems} 项',
+            ),
+          ),
+        );
+      } else {
+        await _showBatchUploadSummaryDialog(uploadResult);
+      }
+    } on TransferCancelledException {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('上传已取消，已完成的项目会保留，未完成的项目可稍后重试')));
+    } on StateError catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message.toString())));
+    }
+  }
+
+  Future<void> _downloadFolderArchive(IndexedFolder folder) async {
+    if (!_controller.hasDownloadDirectory) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('请先在设置页选择固定下载目录'),
+          action: SnackBarAction(
+            label: '前往设置',
+            onPressed: () {
+              setState(() {
+                _currentIndex = 1;
+              });
+            },
+          ),
+        ),
+      );
+      return;
+    }
+
+    final permissionResult =
+        await StoragePermissionService.ensureFileWritePermission();
+    if (!mounted) {
+      return;
+    }
+
+    if (permissionResult != StoragePermissionResult.granted) {
+      final deniedPermanently =
+          permissionResult == StoragePermissionResult.permanentlyDenied;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            deniedPermanently
+                ? '文件写入权限被永久拒绝，请前往系统设置开启后重试'
+                : '未获得文件写入权限，无法下载到外部目录',
+          ),
+          action: deniedPermanently
+              ? SnackBarAction(label: '设置', onPressed: openAppSettings)
+              : null,
+        ),
+      );
+      return;
+    }
+
+    final folderPasswords = await _collectArchiveFolderPasswords(folder);
+    if (folderPasswords == null) {
+      return;
+    }
+    for (final entry in folderPasswords.entries) {
+      _controller.unlockFolder(entry.key, entry.value);
+    }
+
+    try {
+      final savedFile = await _runTransferWithDialog<File?>(
+        title: '下载压缩包',
+        fileName: '${folder.name}.zip',
+        summaryText: '正在打包并下载“${folder.name}”的全部内容',
+        action: (onProgress, cancelToken) {
+          return _controller.downloadFolderArchiveToConfiguredDirectoryWithProgress(
+            folder,
+            folderPasswords: folderPasswords,
             onProgress: onProgress,
             cancelToken: cancelToken,
           );
@@ -1550,30 +1786,112 @@ class _FileManagerPageState extends State<FileManagerPage> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(success ? '上传完成' : '上传失败，请查看日志')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            savedFile != null
+                ? '“${folder.name}”压缩包已下载到固定目录'
+                : '“${folder.name}”压缩包下载失败，请查看日志',
+          ),
+        ),
+      );
     } on TransferCancelledException {
       if (!mounted) {
         return;
       }
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('上传已暂停，再次选择同一文件可继续传输')));
+      ).showSnackBar(SnackBar(content: Text('“${folder.name}”压缩包下载已取消')));
     }
   }
 
-  Future<T> _runTransferWithDialog<T>({
+  Future<void> _showBatchUploadSummaryDialog(BatchUploadResult result) async {
+    final failurePreview = result.failures.take(8).toList(growable: false);
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(result.succeededItems > 0 ? '批量上传部分完成' : '批量上传失败'),
+          content: SizedBox(
+            width: 460,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '本次共处理 ${result.totalItems} 项，成功 ${result.succeededItems} 项，失败 ${result.failedItems} 项。',
+                ),
+                const SizedBox(height: 12),
+                if (failurePreview.isNotEmpty)
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 220),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: failurePreview
+                            .map(
+                              (failure) => Padding(
+                                padding: const EdgeInsets.only(bottom: 10),
+                                child: RichText(
+                                  text: TextSpan(
+                                    style: Theme.of(context).textTheme.bodySmall,
+                                    children: <InlineSpan>[
+                                      TextSpan(
+                                        text: '[${failure.type.label}] ${failure.label}\n',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(fontWeight: FontWeight.w700),
+                                      ),
+                                      TextSpan(text: failure.error),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            )
+                            .toList(growable: false),
+                      ),
+                    ),
+                  ),
+                if (result.failedItems > failurePreview.length)
+                  Text(
+                    '其余 ${result.failedItems - failurePreview.length} 项失败详情已写入操作日志。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                const SizedBox(height: 8),
+                Text(
+                  '如果同一批次里同时出现网络失败、密码失败和服务端拒绝，建议优先处理密码失败项，再针对其余项重试。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<T> _runBatchTransferWithDialog<T>({
     required String title,
-    required String fileName,
+    required String initialFileName,
+    String? summaryText,
     required Future<T> Function(
-      TransferProgressCallback onProgress,
+      BatchTransferProgressCallback onProgress,
       TransferCancellationToken cancelToken,
     )
     action,
   }) async {
     final progressNotifier = ValueNotifier<_TransferDialogState>(
-      const _TransferDialogState(
+      _TransferDialogState(
+        fileName: initialFileName,
+        summaryText: summaryText,
+        detailText: null,
         transferredBytes: 0,
         totalBytes: null,
         active: true,
@@ -1592,7 +1910,91 @@ class _FileManagerPageState extends State<FileManagerPage> {
             builder: (context, state, _) {
               return TransferProgressDialog(
                 title: title,
-                fileName: fileName,
+                fileName: state.fileName,
+                summaryText: state.summaryText,
+                detailText: state.detailText,
+                transferredBytes: state.transferredBytes,
+                totalBytes: state.totalBytes,
+                active: state.active,
+                onCancel: () {
+                  if (!state.active) {
+                    return;
+                  }
+                  progressNotifier.value = state.copyWith(active: false);
+                  cancelToken.cancel();
+                },
+              );
+            },
+          ),
+        );
+      },
+    );
+
+    try {
+      final result = await action((progress) {
+        final state = progressNotifier.value;
+        progressNotifier.value = state.copyWith(
+          fileName: progress.currentItemLabel,
+          summaryText: progress.totalItems <= 1
+              ? '当前正在处理 1 项内容'
+              : '当前第 ${progress.completedItems + 1 > progress.totalItems ? progress.totalItems : progress.completedItems + 1} / ${progress.totalItems} 项',
+          detailText: progress.statusText,
+          transferredBytes: progress.transferredBytes,
+          totalBytes: progress.totalBytes,
+        );
+      }, cancelToken);
+      if (navigator.mounted) {
+        navigator.pop();
+      }
+      await dialogFuture;
+      return result;
+    } catch (_) {
+      if (navigator.mounted) {
+        navigator.pop();
+      }
+      await dialogFuture;
+      rethrow;
+    } finally {
+      progressNotifier.dispose();
+    }
+  }
+
+  Future<T> _runTransferWithDialog<T>({
+    required String title,
+    required String fileName,
+    String? summaryText,
+    required Future<T> Function(
+      TransferProgressCallback onProgress,
+      TransferCancellationToken cancelToken,
+    )
+    action,
+  }) async {
+    final progressNotifier = ValueNotifier<_TransferDialogState>(
+      _TransferDialogState(
+        fileName: fileName,
+        summaryText: summaryText,
+        detailText: null,
+        transferredBytes: 0,
+        totalBytes: null,
+        active: true,
+      ),
+    );
+    final cancelToken = TransferCancellationToken();
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final dialogFuture = showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return PopScope(
+          canPop: false,
+          child: ValueListenableBuilder<_TransferDialogState>(
+            valueListenable: progressNotifier,
+            builder: (context, state, _) {
+              return TransferProgressDialog(
+                title: title,
+                fileName: state.fileName,
+                summaryText: state.summaryText,
+                detailText: state.detailText,
                 transferredBytes: state.transferredBytes,
                 totalBytes: state.totalBytes,
                 active: state.active,
@@ -2035,6 +2437,14 @@ class _FileManagerPageState extends State<FileManagerPage> {
                 },
               ),
               ListTile(
+                leading: const Icon(Icons.archive_outlined),
+                title: const Text('下载为压缩包'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _downloadFolderArchive(folder);
+                },
+              ),
+              ListTile(
                 leading: const Icon(Icons.settings_outlined),
                 title: const Text('管理文件夹'),
                 onTap: () {
@@ -2201,7 +2611,53 @@ class _FileManagerPageState extends State<FileManagerPage> {
     }
 
     if (_controller.previewLoading && imageBytes == null) {
-      return const Center(child: CircularProgressIndicator());
+      final totalBytes = _controller.previewTotalBytes;
+      final transferredBytes = _controller.previewTransferredBytes;
+      final progressValue = totalBytes == null || totalBytes <= 0
+          ? null
+          : transferredBytes / totalBytes;
+      final progressText = totalBytes == null || totalBytes <= 0
+          ? '已加载 ${ManagedFileTile.formatSize(transferredBytes)}'
+          : '${ManagedFileTile.formatSize(transferredBytes)} / ${ManagedFileTile.formatSize(totalBytes)}';
+      final percentText = progressValue == null
+          ? '正在获取图片...'
+          : '正在获取图片... ${(progressValue * 100).clamp(0, 100).toStringAsFixed(1)}%';
+
+      return Container(
+        decoration: panelDecoration,
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 320),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const Icon(
+                    Icons.downloading_rounded,
+                    size: 56,
+                    color: Color(0xFF8A8A8A),
+                  ),
+                  const SizedBox(height: 20),
+                  LinearProgressIndicator(value: progressValue),
+                  const SizedBox(height: 14),
+                  Text(
+                    percentText,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    progressText,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
     }
 
     if (error != null) {
@@ -2219,7 +2675,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
     if (imageBytes == null) {
       return Container(
         decoration: panelDecoration,
-        child: const Center(child: Text('预览数据为空')),
+        child: const Center(child: Text('图片数据为空')),
       );
     }
 
@@ -2355,7 +2811,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
             },
           );
 
-    return RefreshIndicator(
+    final content = RefreshIndicator(
       onRefresh: _refreshFiles,
       child: Stack(
         children: <Widget>[
@@ -2394,6 +2850,97 @@ class _FileManagerPageState extends State<FileManagerPage> {
                           const SizedBox(width: 10),
                           Text(
                             '正在获取文件夹内容...',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+
+    if (!_supportsDesktopDrop) {
+      return content;
+    }
+
+    return DropTarget(
+      onDragEntered: (_) {
+        if (_controller.busy) {
+          return;
+        }
+        setState(() {
+          _draggingUpload = true;
+        });
+      },
+      onDragExited: (_) {
+        if (!_draggingUpload) {
+          return;
+        }
+        setState(() {
+          _draggingUpload = false;
+        });
+      },
+      onDragDone: (detail) async {
+        if (_draggingUpload && mounted) {
+          setState(() {
+            _draggingUpload = false;
+          });
+        }
+        final droppedEntries = await _normalizeDroppedEntities(detail.files);
+        if (!mounted || droppedEntries.isEmpty) {
+          return;
+        }
+        await _showUploadDialog(initialEntries: droppedEntries);
+      },
+      child: Stack(
+        children: <Widget>[
+          Positioned.fill(child: content),
+          if (_draggingUpload)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primaryContainer
+                        .withValues(alpha: 0.74),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.primary,
+                      width: 2,
+                    ),
+                  ),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 16,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.96),
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: const <BoxShadow>[
+                          BoxShadow(
+                            color: Color(0x22000000),
+                            blurRadius: 18,
+                            offset: Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: <Widget>[
+                          const Icon(Icons.file_upload_outlined, size: 36),
+                          const SizedBox(height: 10),
+                          Text(
+                            '松开以上传文件或文件夹',
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '将上传到 ${_controller.currentFolderPathLabel}，文件夹会保留原有层级。',
+                            textAlign: TextAlign.center,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                         ],
@@ -2498,6 +3045,8 @@ class _FileManagerPageState extends State<FileManagerPage> {
                     switch (value) {
                       case _HomeActionMenuItem.uploadFile:
                         _showUploadDialog();
+                      case _HomeActionMenuItem.uploadFolder:
+                        _showUploadDialog(pickDirectory: true);
                       case _HomeActionMenuItem.createFolder:
                         _showCreateFolderDialog();
                     }
@@ -2510,6 +3059,14 @@ class _FileManagerPageState extends State<FileManagerPage> {
                             contentPadding: EdgeInsets.zero,
                             leading: Icon(Icons.upload_file_rounded),
                             title: Text('上传文件'),
+                          ),
+                        ),
+                        PopupMenuItem<_HomeActionMenuItem>(
+                          value: _HomeActionMenuItem.uploadFolder,
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.drive_folder_upload_outlined),
+                            title: Text('上传文件夹'),
                           ),
                         ),
                         PopupMenuItem<_HomeActionMenuItem>(
@@ -2569,9 +3126,12 @@ class _FileManagerPageState extends State<FileManagerPage> {
 }
 
 class _UploadDialogResult {
-  const _UploadDialogResult({required this.file, required this.permanent});
+  const _UploadDialogResult({
+    required this.entries,
+    required this.permanent,
+  });
 
-  final File file;
+  final List<FileSystemEntity> entries;
   final bool permanent;
 }
 
@@ -2649,7 +3209,7 @@ class _FolderManagementDialogResult {
   final String? newPassword;
 }
 
-enum _HomeActionMenuItem { uploadFile, createFolder }
+enum _HomeActionMenuItem { uploadFile, uploadFolder, createFolder }
 
 class _BrowserEntry {
   const _BrowserEntry.folder(this.folder) : file = null;
@@ -2980,7 +3540,7 @@ class _BaseUrlPresetDialogState extends State<_BaseUrlPresetDialog> {
     super.initState();
     _nameController = TextEditingController(text: widget.preset?.name ?? '');
     _baseUrlController = TextEditingController(
-      text: widget.preset?.baseUrl ?? 'https://',
+      text: widget.preset?.baseUrl ?? '',
     );
   }
 
@@ -3046,7 +3606,10 @@ class _BaseUrlPresetDialogState extends State<_BaseUrlPresetDialog> {
             TextField(
               controller: _baseUrlController,
               keyboardType: TextInputType.url,
-              decoration: const InputDecoration(labelText: 'Base URL'),
+              decoration: const InputDecoration(
+                labelText: 'Base URL',
+                hintText: 'https://example.com',
+              ),
               onChanged: (_) {
                 if (_validationMessage == null) {
                   return;
@@ -3190,21 +3753,33 @@ class _ServerLatencyDialogState extends State<_ServerLatencyDialog> {
 
 class _TransferDialogState {
   const _TransferDialogState({
+    required this.fileName,
+    required this.summaryText,
+    required this.detailText,
     required this.transferredBytes,
     required this.totalBytes,
     required this.active,
   });
 
+  final String fileName;
+  final String? summaryText;
+  final String? detailText;
   final int transferredBytes;
   final int? totalBytes;
   final bool active;
 
   _TransferDialogState copyWith({
+    String? fileName,
+    String? summaryText,
+    String? detailText,
     int? transferredBytes,
     int? totalBytes,
     bool? active,
   }) {
     return _TransferDialogState(
+      fileName: fileName ?? this.fileName,
+      summaryText: summaryText ?? this.summaryText,
+      detailText: detailText ?? this.detailText,
       transferredBytes: transferredBytes ?? this.transferredBytes,
       totalBytes: totalBytes ?? this.totalBytes,
       active: active ?? this.active,

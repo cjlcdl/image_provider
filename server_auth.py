@@ -137,3 +137,49 @@ def validate_folder_password_token(
     if not verify_folder_password(folder_record, password):
         return False, None, 40302, "invalid folder password"
     return True, password, 0, "ok"
+
+
+def validate_folder_passwords_token(
+    token_value: str,
+    expected_folder_ids: list,
+) -> Tuple[bool, Optional[Dict[str, str]], int, str]:
+    is_valid, payload, code, message = validate_rsa_json_token(token_value)
+    if not is_valid:
+        return False, None, code, message
+    if payload is None:
+        return False, None, 40107, "invalid folder passwords token"
+
+    raw_folders = payload.get("folders")
+    if not isinstance(raw_folders, list):
+        return False, None, 40107, "invalid folder passwords token"
+
+    provided_passwords: Dict[str, str] = {}
+    for item in raw_folders:
+        if not isinstance(item, dict):
+            return False, None, 40107, "invalid folder passwords token"
+        folder_id = item.get("folderId")
+        password = item.get("password")
+        if not isinstance(folder_id, str) or not folder_id:
+            return False, None, 40107, "invalid folder passwords token"
+        if not isinstance(password, str) or not password:
+            return False, None, 40107, "invalid folder passwords token"
+        provided_passwords[folder_id] = password
+
+    validated_passwords: Dict[str, str] = {}
+    for folder_id in expected_folder_ids:
+        if not isinstance(folder_id, str) or not folder_id:
+            continue
+        folder_record = get_folder(folder_id)
+        if folder_record is None:
+            return False, None, 40403, "folder not found"
+        if not folder_requires_password(folder_record):
+            continue
+
+        password = provided_passwords.get(folder_id)
+        if not isinstance(password, str) or not password:
+            return False, None, 40107, "missing folder passwords token"
+        if not verify_folder_password(folder_record, password):
+            return False, None, 40302, "invalid folder password"
+        validated_passwords[folder_id] = password
+
+    return True, validated_passwords, 0, "ok"

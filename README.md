@@ -6,6 +6,8 @@
 - 流式分片上传与断点续传
 - 文件列表、重命名、删除、切换临时/永久存储
 - 虚拟多级文件夹、加密文件夹、文件移动到文件夹
+- Windows 桌面端拖拽上传文件与文件夹
+- 文件夹递归上传与服务端打包 zip 下载
 - 受保护文件的临时下载直链
 - 基于 `Courage-Token` 的管理鉴权
 - 基于 `APP_CHANNEL`、`USER` 的审计日志记录
@@ -181,6 +183,14 @@ flutter run --dart-define=BASE_URL=https://your-domain.com --dart-define=APP_CHA
 - `APP_CHANNEL`：可选，用于写入服务端审计日志
 - `USER`：可选，用于写入服务端审计日志
 
+如果你要调试 Windows 桌面端，可直接运行：
+
+```powershell
+cd .\flutter_client_app
+python generate_public_key_dart.py
+flutter run -d windows --dart-define=BASE_URL=https://your-domain.com --dart-define=APP_CHANNEL=dev --dart-define=USER=Karo
+```
+
 ### 3. 构建 Android APK
 
 手动构建：
@@ -202,6 +212,26 @@ python build_release.py
 [flutter_client_app/build_release.py](flutter_client_app/build_release.py) 会在构建前自动生成 [flutter_client_app/lib/data/generated_public_key.dart](flutter_client_app/lib/data/generated_public_key.dart)，构建完成后自动恢复为空占位内容。
 
 如果你直接启动客户端而没有先生成公钥文件，应用启动时会直接显示配置错误页，而不是等到首次发请求时才失败。
+
+### 4. Windows 桌面端使用说明
+
+当前 Flutter 客户端已经支持 Windows 桌面端以下交互：
+
+- 在文件页直接把文件或文件夹拖到文件列表区域，即可触发上传。
+- 拖入文件夹时会保留根文件夹和子文件夹层级；如果服务端已存在同名文件夹，会自动合并到现有目录。
+- 如果拖拽或上传过程中涉及加密文件夹，客户端会在需要时提示输入对应密码。
+- 多文件和文件夹批量上传时，弹窗会显示当前处理项、总进度，以及成功/失败数量；失败项详情会在完成后汇总显示。
+
+### 5. 文件夹压缩下载使用说明
+
+客户端文件页长按文件夹后，可选择“下载为压缩包”。
+
+使用前请注意：
+
+- 需要先在设置页选择固定下载目录。
+- 下载的是服务端实时生成的 zip 压缩包，会递归包含该文件夹下全部子文件夹和文件。
+- 如果压缩范围内包含加密文件夹，客户端会要求验证所有实际涉及到的加密文件夹密码。
+- 下载过程中会显示进度条；完成后压缩包会保存到固定下载目录。
 
 ## 存储与清理行为
 
