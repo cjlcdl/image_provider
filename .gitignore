@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+
+# Runtime data
+storage/
+downloads/
+logs/
+
+# Secrets
+# keys/
+*.pem
+*.key
+*.keystore
+*.jks
+
+# Editor files
+.idea/
+*.iml
+
+# Flutter client generated files
+flutter_client_app/.dart_tool/
+flutter_client_app/.flutter-plugins-dependencies
+flutter_client_app/.metadata
+flutter_client_app/.idea/
+flutter_client_app/build/
+flutter_client_app/android/.gradle/
+flutter_client_app/android/.kotlin/
+flutter_client_app/android/local.properties
+flutter_client_app/*.apk
+flutter_client_app/*.APK
+flutter_client_app/build_release.py
+# .gitignore
