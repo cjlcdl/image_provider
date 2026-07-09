@@ -110,6 +110,7 @@ class FileManagerController extends ChangeNotifier {
   static const String _selectedBaseUrlPresetIdPreferenceKey =
       'selected_base_url_preset_id';
   static const String _defaultBaseUrlPresetId = '__default_base_url__';
+  static const String _columnWidthsPreferenceKey = 'detail_column_widths';
 
   FileManagerController({
     required String initialBaseUrl,
@@ -161,6 +162,18 @@ class FileManagerController extends ChangeNotifier {
   String? _previewError;
   int _previewTransferredBytes = 0;
   int? _previewTotalBytes;
+  String? _lastActionError;
+  bool _lastActionWasBusy = false;
+  String? _sortColumnName;
+  bool _sortAscending = true;
+  final Map<String, double> _columnWidths =
+      <String, double>{}; // key: DetailColumn.name
+
+  /// 当前排序列名（'name'/'type'/'size'/'uploadedAt'），null=不排序。
+  String? get sortColumnName => _sortColumnName;
+  bool get sortAscending => _sortAscending;
+  Map<String, double> get columnWidths =>
+      Map<String, double>.unmodifiable(_columnWidths);
 
   bool get busy => _busy;
   bool get previewLoading => _previewLoading;
@@ -178,6 +191,54 @@ class FileManagerController extends ChangeNotifier {
   String get downloadDirectory => _downloadDirectory;
   bool get hasDownloadDirectory => _downloadDirectory.trim().isNotEmpty;
   List<ManagedFile> get files => List<ManagedFile>.unmodifiable(_files);
+
+  /// 排序后的文件列表（用于详情表视图）。
+  List<ManagedFile> get sortedFiles {
+    if (_sortColumnName == null) return files;
+    final sorted = List<ManagedFile>.from(_files);
+    sorted.sort(_fileComparator);
+    return List<ManagedFile>.unmodifiable(
+      _sortAscending ? sorted : sorted.reversed.toList(),
+    );
+  }
+
+  /// 排序后的文件夹列表。
+  List<IndexedFolder> get sortedFolders {
+    if (_sortColumnName == null) return folders;
+    final sorted = List<IndexedFolder>.from(_folders);
+    sorted.sort(_folderComparator);
+    return List<IndexedFolder>.unmodifiable(
+      _sortAscending ? sorted : sorted.reversed.toList(),
+    );
+  }
+
+  int _fileComparator(ManagedFile a, ManagedFile b) {
+    switch (_sortColumnName) {
+      case 'name':
+        final labelA = a.indexedName.isEmpty ? a.systemName : a.indexedName;
+        final labelB = b.indexedName.isEmpty ? b.systemName : b.indexedName;
+        return labelA.toLowerCase().compareTo(labelB.toLowerCase());
+      case 'type':
+        return a.mimeType.toLowerCase().compareTo(b.mimeType.toLowerCase());
+      case 'size':
+        return a.size.compareTo(b.size);
+      case 'uploadedAt':
+        return (a.uploadedAt ?? '').compareTo(b.uploadedAt ?? '');
+      default:
+        return 0;
+    }
+  }
+
+  int _folderComparator(IndexedFolder a, IndexedFolder b) {
+    switch (_sortColumnName) {
+      case 'name':
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      case 'uploadedAt':
+        return (a.createdAt ?? '').compareTo(b.createdAt ?? '');
+      default:
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    }
+  }
   List<IndexedFolder> get folders => List<IndexedFolder>.unmodifiable(_folders);
   List<ManagedFile> get selectedFiles => _files
       .where((item) => _selectedPaths.contains(item.path))
@@ -211,6 +272,8 @@ class FileManagerController extends ChangeNotifier {
   String? get previewError => _previewError;
   int get previewTransferredBytes => _previewTransferredBytes;
   int? get previewTotalBytes => _previewTotalBytes;
+  String? get lastActionError => _lastActionError;
+  bool get lastActionWasBusy => _lastActionWasBusy;
 
   IndexedFolder? get currentFolder {
     final folderId = _currentFolderId;
@@ -476,6 +539,7 @@ class FileManagerController extends ChangeNotifier {
     if (preferredPreset != null) {
       _applyBaseUrlPreset(preferredPreset, notify: false, appendLog: false);
     }
+    _loadColumnWidths(preferences);
     notifyListeners();
   }
 
@@ -1047,6 +1111,7 @@ class FileManagerController extends ChangeNotifier {
     ManagedFile file, {
     TransferProgressCallback? onProgress,
     TransferCancellationToken? cancelToken,
+    void Function(int resumedBytes)? onResume,
   }) async {
     if (!hasDownloadDirectory) {
       _appendLog('下载失败: 未设置固定下载目录');
@@ -1058,6 +1123,18 @@ class FileManagerController extends ChangeNotifier {
       directoryPath: _downloadDirectory,
       file: file,
     );
+
+    // 检测断点续传
+    final partialFile = File('${saveFile.path}.part');
+    if (await partialFile.exists()) {
+      final resumedBytes = await partialFile.length();
+      if (resumedBytes > 0) {
+        _appendLog(
+          '检测到未完成的下载（已传输 ${_formatBytes(resumedBytes)}），将尝试续传',
+        );
+        onResume?.call(resumedBytes);
+      }
+    }
 
     final resolvedDownloadPath = await _resolveDownloadPath(file);
     final savedFile = await _runTransferAction<File>('下载文件', () async {
@@ -1156,8 +1233,22 @@ class FileManagerController extends ChangeNotifier {
       final cacheDirectory = await getTemporaryDirectory();
       final beforeSize = await _calculateDirectorySize(cacheDirectory);
       await _clearDirectoryChildren(cacheDirectory);
+
+      // 清理分享上传缓存目录
+      final sharedUploadsDir = Directory(
+        '${cacheDirectory.path}${Platform.pathSeparator}shared_uploads',
+      );
+      if (await sharedUploadsDir.exists()) {
+        await sharedUploadsDir.delete(recursive: true);
+      }
+
+      // 清理续传上传状态文件
+      await _client.clearResumableUploadStates();
+
       _cacheBytes = await _calculateDirectorySize(cacheDirectory);
-      _appendLog('已清除缓存: ${_formatBytes(beforeSize)}');
+      _appendLog(
+        '已清除缓存: ${_formatBytes(beforeSize)}（含分享缓存和续传状态）',
+      );
       return true;
     } catch (error) {
       _appendLog('清除缓存失败: $error');
@@ -1588,10 +1679,14 @@ class FileManagerController extends ChangeNotifier {
 
   Future<T?> _runAction<T>(String label, Future<T> Function() action) async {
     if (_busy) {
+      _lastActionWasBusy = true;
+      _lastActionError = '另一项操作正在进行中，请稍后重试';
       return null;
     }
 
     _busy = true;
+    _lastActionWasBusy = false;
+    _lastActionError = null;
     _appendLog('开始: $label');
     notifyListeners();
 
@@ -1601,6 +1696,7 @@ class FileManagerController extends ChangeNotifier {
       _appendLog(_safeStringifyResult(result));
       return result;
     } catch (error) {
+      _lastActionError = error.toString();
       _appendLog('$label失败: $error');
       return null;
     } finally {
@@ -1636,10 +1732,14 @@ class FileManagerController extends ChangeNotifier {
     Future<T> Function() action,
   ) async {
     if (_busy) {
+      _lastActionWasBusy = true;
+      _lastActionError = '另一项传输正在进行中，请稍后重试';
       return null;
     }
 
     _busy = true;
+    _lastActionWasBusy = false;
+    _lastActionError = null;
     _appendLog('开始: $label');
     notifyListeners();
 
@@ -1650,8 +1750,10 @@ class FileManagerController extends ChangeNotifier {
       return result;
     } on TransferCancelledException {
       _appendLog('$label已取消');
+      _lastActionError = '传输已取消';
       rethrow;
     } catch (error) {
+      _lastActionError = error.toString();
       _appendLog('$label失败: $error');
       return null;
     } finally {
@@ -2093,6 +2195,58 @@ class FileManagerController extends ChangeNotifier {
     }
 
     _previewFile = updatedPreview;
+  }
+
+  /// 设置排序列。同一列再次点击切换升降序。
+  void setSortColumn(String columnName) {
+    if (_sortColumnName == columnName) {
+      _sortAscending = !_sortAscending;
+    } else {
+      _sortColumnName = columnName;
+      _sortAscending = true;
+    }
+    notifyListeners();
+  }
+
+  /// 清除排序，恢复默认顺序。
+  void clearSort() {
+    _sortColumnName = null;
+    _sortAscending = true;
+    notifyListeners();
+  }
+
+  /// 保存列宽到 SharedPreferences。
+  Future<void> saveColumnWidths(Map<String, double> widths) async {
+    _columnWidths
+      ..clear()
+      ..addAll(widths);
+    final preferences = await SharedPreferences.getInstance();
+    await _persistColumnWidths(preferences);
+    notifyListeners();
+  }
+
+  void _loadColumnWidths(SharedPreferences preferences) {
+    final raw = preferences.getString(_columnWidthsPreferenceKey);
+    if (raw == null || raw.trim().isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) return;
+      _columnWidths.clear();
+      for (final entry in decoded.entries) {
+        final value = (entry.value as num?)?.toDouble();
+        if (value != null && value > 0) {
+          _columnWidths[entry.key] = value;
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _persistColumnWidths(SharedPreferences preferences) async {
+    if (_columnWidths.isEmpty) return;
+    await preferences.setString(
+      _columnWidthsPreferenceKey,
+      jsonEncode(_columnWidths),
+    );
   }
 
   Future<int> _calculateDirectorySize(Directory directory) async {

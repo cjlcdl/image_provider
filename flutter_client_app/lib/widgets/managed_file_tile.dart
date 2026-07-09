@@ -103,11 +103,27 @@ class ManagedFileTile extends StatelessWidget {
     return Icons.insert_drive_file_outlined;
   }
 
+  /// 返回基于扩展名的文件类型标签（如"zip文件""apk文件"）。
+  static String fileTypeLabel(ManagedFile file) {
+    final fileName =
+        (file.indexedName.isEmpty ? file.systemName : file.indexedName)
+            .toLowerCase();
+    final dotIndex = fileName.lastIndexOf('.');
+    if (dotIndex > 0 && dotIndex < fileName.length - 1) {
+      final ext = fileName.substring(dotIndex + 1);
+      // 特殊处理常见压缩格式
+      return "${ext.toUpperCase()}文件";
+    }
+    final mimeType = file.mimeType.toLowerCase();
+    if (mimeType.startsWith('image/')) return '图片文件';
+    if (mimeType.startsWith('video/')) return '视频文件';
+    if (mimeType.startsWith('audio/')) return '音频文件';
+    return '文件';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final displayName = compactDisplayName(
-      file.indexedName.isEmpty ? file.systemName : file.indexedName,
-    );
+    final displayName = file.indexedName.isEmpty ? file.systemName : file.indexedName;
     final titleStyle = Theme.of(context).textTheme.titleSmall?.copyWith(
       fontSize: 14,
       height: 1.15,
@@ -181,13 +197,16 @@ class ManagedFileTile extends StatelessWidget {
                             ),
                           ),
                         Text(
-                          file.mimeType,
+                          formatUploadedAt(file.uploadedAt),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: metaStyle,
+                          style: metaStyle?.copyWith(
+                            fontFamily: 'monospace',
+                            fontSize: 10,
+                          ),
                         ),
                         Text(
-                          formatUploadedAt(file.uploadedAt),
+                          fileTypeLabel(file),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: metaStyle,

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:courage_storage/data/global.dart';
@@ -6,10 +7,14 @@ import 'package:courage_storage/models/base_url_preset.dart';
 import 'package:courage_storage/models/indexed_folder.dart';
 import 'package:courage_storage/models/managed_file.dart';
 import 'package:courage_storage/services/image_bed_client.dart';
+import 'package:courage_storage/services/shared_file_handler.dart';
+import 'package:courage_storage/services/notification_service.dart';
 import 'package:courage_storage/services/storage_permission_service.dart';
 import 'package:courage_storage/widgets/managed_file_tile.dart';
 import 'package:courage_storage/widgets/panel_card.dart';
 import 'package:courage_storage/widgets/transfer_progress_dialog.dart';
+import 'package:courage_storage/widgets/storage_chart.dart';
+import 'package:courage_storage/widgets/detail_table.dart';
 import 'package:cross_file/cross_file.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -40,6 +45,9 @@ class _FileManagerPageState extends State<FileManagerPage> {
   bool _batchMode = false;
   bool _draggingUpload = false;
   String _storageFilter = '';
+  String? _dropTargetFolderId;
+  bool _contextMenuOpen = false;
+  StreamSubscription<List<String>>? _sharedFileSubscription;
 
   String _normalizedFileLabel(ManagedFile file) {
     final value =
@@ -76,6 +84,24 @@ class _FileManagerPageState extends State<FileManagerPage> {
     ];
   }
 
+  List<IndexedFolder> get _sortedChildFolders {
+    final childFolders = _controller.currentChildFolders;
+    final col = _controller.sortColumnName;
+    if (col == null) return childFolders;
+    final sorted = List<IndexedFolder>.from(childFolders);
+    sorted.sort((a, b) {
+      switch (col) {
+        case 'name':
+          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+        case 'uploadedAt':
+          return (a.createdAt ?? '').compareTo(b.createdAt ?? '');
+        default:
+          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      }
+    });
+    return _controller.sortAscending ? sorted : sorted.reversed.toList();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -104,10 +130,17 @@ class _FileManagerPageState extends State<FileManagerPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _controller.refreshCacheSize();
     });
+
+    if (SharedFileHandler.instance.isAvailable) {
+      _sharedFileSubscription = SharedFileHandler
+          .instance.onSharedFilesReceived
+          .listen(_handleSharedFiles);
+    }
   }
 
   @override
   void dispose() {
+    _sharedFileSubscription?.cancel();
     if (_ownsController) {
       _controller.dispose();
     }
@@ -312,7 +345,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
   }
 
   Future<void> _chooseDownloadDirectory() async {
-    final directoryPath = await FilePicker.platform.getDirectoryPath(
+    final directoryPath = await FilePicker.getDirectoryPath(
       dialogTitle: '选择固定下载目录',
     );
     if (!mounted || directoryPath == null || directoryPath.trim().isEmpty) {
@@ -1013,7 +1046,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
     required bool pickDirectory,
   }) async {
     if (pickDirectory) {
-      final directoryPath = await FilePicker.platform.getDirectoryPath(
+      final directoryPath = await FilePicker.getDirectoryPath(
         dialogTitle: '选择要上传的文件夹',
       );
       if (directoryPath == null || directoryPath.trim().isEmpty) {
@@ -1022,10 +1055,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
       return <FileSystemEntity>[Directory(directoryPath)];
     }
 
-    final picked = await FilePicker.platform.pickFiles(
-      withData: false,
-      allowMultiple: true,
-    );
+    final picked = await FilePicker.pickFiles();
     if (picked == null || picked.files.isEmpty) {
       return const <FileSystemEntity>[];
     }
@@ -1514,9 +1544,29 @@ class _FileManagerPageState extends State<FileManagerPage> {
     );
   }
 
+  Future<void> _handleSharedFiles(List<String> filePaths) async {
+    if (filePaths.isEmpty || !mounted) return;
+
+    // 等待页面初始化完成后再处理
+    await WidgetsBinding.instance.endOfFrame;
+
+    final entities = <FileSystemEntity>[];
+    for (final path in filePaths) {
+      final file = File(path);
+      if (await file.exists()) {
+        entities.add(file);
+      }
+    }
+
+    if (entities.isEmpty || !mounted) return;
+
+    await _showUploadDialog(initialEntries: entities);
+  }
+
   Future<void> _showUploadDialog({
     List<FileSystemEntity>? initialEntries,
     bool pickDirectory = false,
+    String? targetFolderId,
   }) async {
     final currentFolderId = _controller.currentFolderId;
     final currentFolder = _controller.folderById(currentFolderId);
@@ -1531,12 +1581,19 @@ class _FileManagerPageState extends State<FileManagerPage> {
     var selectedEntries = initialEntries?.toList(growable: true) ??
         <FileSystemEntity>[];
     var permanent = false;
+    var selectedFolderId = targetFolderId ?? currentFolderId;
+    var selectedFolderPassword =
+        _controller.unlockedFolderPassword(selectedFolderId) ?? '';
 
     final uploadDialogResult = await showDialog<_UploadDialogResult>(
       context: context,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
+            final selectedFolder =
+                _controller.folderById(selectedFolderId);
+            final needsTargetPassword =
+                selectedFolder?.encrypted == true;
             return AlertDialog(
               title: Text(pickDirectory ? '上传文件夹' : '上传文件'),
               content: SizedBox(
@@ -1605,16 +1662,66 @@ class _FileManagerPageState extends State<FileManagerPage> {
                         ),
                     ],
                     const SizedBox(height: 16),
-                    Text(
-                      '上传到: ${_controller.currentFolderPathLabel}',
-                      style: Theme.of(context).textTheme.bodySmall,
+                    DropdownButtonFormField<String>(
+                      initialValue: selectedFolderId ?? '',
+                      decoration: const InputDecoration(
+                        labelText: '上传到',
+                        isDense: true,
+                      ),
+                      items: <DropdownMenuItem<String>>[
+                        const DropdownMenuItem<String>(
+                          value: '',
+                          child: Text('根目录 /'),
+                        ),
+                        ..._controller.folders.map(
+                          (folder) => DropdownMenuItem<String>(
+                            value: folder.id,
+                            child: Text(
+                              folder.path,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        setDialogState(() {
+                          selectedFolderId =
+                              value == null || value.isEmpty
+                                  ? null
+                                  : value;
+                          selectedFolderPassword =
+                              _controller.unlockedFolderPassword(
+                                selectedFolderId,
+                              ) ??
+                              '';
+                        });
+                      },
                     ),
+                    if (needsTargetPassword) ...<Widget>[
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        key: ValueKey<String>(
+                          'upload-folder-password-$selectedFolderId',
+                        ),
+                        initialValue: selectedFolderPassword,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: '目标文件夹密码',
+                          isDense: true,
+                        ),
+                        onChanged: (value) {
+                          selectedFolderPassword = value;
+                        },
+                      ),
+                    ],
                     const SizedBox(height: 8),
                     if(pickDirectory)
                       Text('将保留所选文件夹的完整目录结构；若遇到同名文件夹，会合并到现有目录。',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
-                    if (currentFolder?.encrypted == true) ...<Widget>[
+                    if (currentFolder?.encrypted == true &&
+                        selectedFolderId == currentFolderId) ...<Widget>[
                       const SizedBox(height: 8),
                       Text(
                         '当前目录已加密，本次上传将使用当前目录已验证的密码。',
@@ -1648,8 +1755,10 @@ class _FileManagerPageState extends State<FileManagerPage> {
                       : () {
                           Navigator.of(context).pop(
                             _UploadDialogResult(
-                              entries: selectedEntries.toList(growable: false),
+                              entries:
+                                  selectedEntries.toList(growable: false),
                               permanent: permanent,
+                              folderId: selectedFolderId,
                             ),
                           );
                         },
@@ -1666,10 +1775,19 @@ class _FileManagerPageState extends State<FileManagerPage> {
       return;
     }
 
+    final effectiveFolderId = uploadDialogResult.folderId ?? currentFolderId;
+    final effectiveFolderPassword =
+        uploadDialogResult.folderId != null &&
+                uploadDialogResult.folderId != currentFolderId
+            ? selectedFolderPassword
+            : currentFolder?.encrypted == true
+                ? _controller.unlockedFolderPassword(currentFolderId)
+                : null;
+
     try {
-      final folderPassword = currentFolder?.encrypted == true
-          ? _controller.unlockedFolderPassword(currentFolderId)
-          : null;
+      final resolvedPassword = effectiveFolderPassword?.isNotEmpty == true
+          ? effectiveFolderPassword
+          : _controller.unlockedFolderPassword(effectiveFolderId);
       final uploadResult = await _runBatchTransferWithDialog<BatchUploadResult>(
         title: '上传中',
         initialFileName: _describeUploadSelection(uploadDialogResult.entries),
@@ -1678,8 +1796,8 @@ class _FileManagerPageState extends State<FileManagerPage> {
           return _controller.uploadFileSystemEntitiesWithProgress(
             entities: uploadDialogResult.entries,
             permanent: uploadDialogResult.permanent,
-            folderId: currentFolderId,
-            folderPassword: folderPassword,
+            folderId: effectiveFolderId,
+            folderPassword: resolvedPassword,
             cancelToken: cancelToken,
             resolveFolderPassword: _resolveUploadFolderPassword,
             onBatchProgress: onProgress,
@@ -1904,7 +2022,15 @@ class _FileManagerPageState extends State<FileManagerPage> {
       barrierDismissible: false,
       builder: (dialogContext) {
         return PopScope(
-          canPop: false,
+          canPop: true,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            final state = progressNotifier.value;
+            if (state.active) {
+              progressNotifier.value = state.copyWith(active: false);
+              cancelToken.cancel();
+            }
+          },
           child: ValueListenableBuilder<_TransferDialogState>(
             valueListenable: progressNotifier,
             builder: (context, state, _) {
@@ -1930,7 +2056,13 @@ class _FileManagerPageState extends State<FileManagerPage> {
       },
     );
 
+    var notifId = -1;
     try {
+      notifId = NotificationService.instance.showProgress(
+        title: title,
+        body: '准备中: $initialFileName',
+        maxProgress: 100,
+      );
       final result = await action((progress) {
         final state = progressNotifier.value;
         progressNotifier.value = state.copyWith(
@@ -1942,16 +2074,28 @@ class _FileManagerPageState extends State<FileManagerPage> {
           transferredBytes: progress.transferredBytes,
           totalBytes: progress.totalBytes,
         );
+        if (progress.totalBytes > 0) {
+          final pct = ((progress.transferredBytes / progress.totalBytes) * 100)
+              .clamp(0, 100)
+              .toInt();
+          NotificationService.instance.updateProgress(
+            notifId,
+            body: '${progress.currentItemLabel} — $pct%',
+            progress: pct,
+          );
+        }
       }, cancelToken);
       if (navigator.mounted) {
         navigator.pop();
       }
+      NotificationService.instance.complete(notifId, body: '传输完成');
       await dialogFuture;
       return result;
     } catch (_) {
       if (navigator.mounted) {
         navigator.pop();
       }
+      NotificationService.instance.fail(notifId, body: '传输中断');
       await dialogFuture;
       rethrow;
     } finally {
@@ -1986,7 +2130,15 @@ class _FileManagerPageState extends State<FileManagerPage> {
       barrierDismissible: false,
       builder: (dialogContext) {
         return PopScope(
-          canPop: false,
+          canPop: true,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            final state = progressNotifier.value;
+            if (state.active) {
+              progressNotifier.value = state.copyWith(active: false);
+              cancelToken.cancel();
+            }
+          },
           child: ValueListenableBuilder<_TransferDialogState>(
             valueListenable: progressNotifier,
             builder: (context, state, _) {
@@ -2012,23 +2164,41 @@ class _FileManagerPageState extends State<FileManagerPage> {
       },
     );
 
+    var notifId2 = -1;
     try {
+      notifId2 = NotificationService.instance.showProgress(
+        title: title,
+        body: '准备中: $fileName',
+        maxProgress: 100,
+      );
       final result = await action((transferredBytes, totalBytes) {
         final current = progressNotifier.value;
         progressNotifier.value = current.copyWith(
           transferredBytes: transferredBytes,
           totalBytes: totalBytes,
         );
+        if (totalBytes != null && totalBytes > 0) {
+          final pct = ((transferredBytes / totalBytes) * 100)
+              .clamp(0, 100)
+              .toInt();
+          NotificationService.instance.updateProgress(
+            notifId2,
+            body: '$fileName — $pct%',
+            progress: pct,
+          );
+        }
       }, cancelToken);
       if (navigator.mounted) {
         navigator.pop();
       }
+      NotificationService.instance.complete(notifId2, body: '传输完成');
       await dialogFuture;
       return result;
     } catch (_) {
       if (navigator.mounted) {
         navigator.pop();
       }
+      NotificationService.instance.fail(notifId2, body: '传输中断');
       await dialogFuture;
       rethrow;
     } finally {
@@ -2482,117 +2652,283 @@ class _FileManagerPageState extends State<FileManagerPage> {
     );
   }
 
-  Widget _buildFilterSection() {
-    return Column(
+  Widget _buildSettingsPage() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 900;
+        final contentMaxWidth = isWide ? 960.0 : double.infinity;
+
+        return Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: contentMaxWidth),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: isWide
+                  ? _buildSettingsWideLayout()
+                  : _buildSettingsNarrowLayout(),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSettingsWideLayout() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        const SizedBox(height: 6),
-        Wrap(
-          spacing: 12,
-          runSpacing: 12,
-          children: <Widget>[
-            Text('磁盘剩余: ${_controller.diskFreeSizeLabel}'),
-            const SizedBox(height: 6),
-            Text('磁盘总量: ${_controller.diskTotalSizeLabel}'),
-            const SizedBox(height: 6),
-            FilledButton.tonal(
-              onPressed: _controller.busy ? null : _healthCheck,
-              child: const Text('健康检查'),
-            ),
-            OutlinedButton(
-              onPressed: _controller.busy ? null : _showServerLatencyDialog,
-              child: const Text('测速'),
-            ),
-          ],
+        Expanded(
+          flex: 5,
+          child: AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              return PanelCard(
+                title: '空间概览',
+                child: Column(
+                  children: [
+                    SizedBox(
+                      width: double.infinity,
+                      child: StorageChart(
+                        pieSize: 140,
+                        segments: <StorageSegment>[
+                          StorageSegment(
+                            label: '已用空间',
+                            bytes: _controller.diskTotalBytes - _controller.diskFreeBytes,
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                          StorageSegment(
+                            label: '可用空间',
+                            bytes: _controller.diskFreeBytes,
+                            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 20,
+                      runSpacing: 12,
+                      children: [
+                        FilledButton.tonal(
+                          onPressed: _controller.busy ? null : _healthCheck,
+                          child: const Text('健康检查'),
+                        ),
+                        OutlinedButton(
+                          onPressed: _controller.busy ? null : _showServerLatencyDialog,
+                          child: const Text('测速'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          flex: 4,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              PanelCard(
+                title: '下载目录',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    SelectableText(
+                      _controller.hasDownloadDirectory
+                          ? _controller.downloadDirectory
+                          : '当前未设置固定下载目录',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.tonalIcon(
+                      onPressed: _chooseDownloadDirectory,
+                      icon: const Icon(Icons.folder_open_rounded),
+                      label: const Text('选择文件下载目录'),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              PanelCard(
+                title: '缓存管理',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      _controller.cacheBusy
+                          ? '正在统计临时内容大小...'
+                          : '当前临时内容大小: ${_controller.cacheSizeLabel}',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: _controller.cacheBusy
+                              ? null
+                              : () async {
+                                  final success = await _controller.clearCache();
+                                  if (!mounted) {
+                                    return;
+                                  }
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(success ? '缓存已清除' : '缓存清除失败，请查看日志'),
+                                    ),
+                                  );
+                                },
+                          icon: _controller.cacheBusy
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Icon(Icons.cleaning_services_outlined),
+                          label: const Text('一键清除缓存'),
+                        ),
+                        IconButton(
+                          onPressed: _controller.cacheBusy
+                              ? null
+                              : () {
+                                  _controller.refreshCacheSize();
+                                },
+                          icon: const Icon(Icons.refresh_rounded),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ],
     );
   }
 
-  Widget _buildSettingsPage() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          PanelCard(
-            title: '服务器状态',
-            child:  _buildFilterSection(),
+  Widget _buildSettingsNarrowLayout() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        AnimatedBuilder(
+          animation: _controller,
+          builder: (context, _) {
+            return PanelCard(
+              title: '空间概览',
+              child: Column(
+                children: [
+                  StorageChart(
+                    segments: <StorageSegment>[
+                      StorageSegment(
+                        label: '已用空间',
+                        bytes: _controller.diskTotalBytes - _controller.diskFreeBytes,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                      StorageSegment(
+                        label: '可用空间',
+                        bytes: _controller.diskFreeBytes,
+                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 20,
+                    runSpacing: 12,
+                    children: [
+                      FilledButton.tonal(
+                        onPressed: _controller.busy ? null : _healthCheck,
+                        child: const Text('健康检查'),
+                      ),
+                      OutlinedButton(
+                        onPressed: _controller.busy ? null : _showServerLatencyDialog,
+                        child: const Text('测速'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        PanelCard(
+          title: '下载目录',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              SelectableText(
+                _controller.hasDownloadDirectory
+                    ? _controller.downloadDirectory
+                    : '当前未设置固定下载目录',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 16),
+              FilledButton.tonalIcon(
+                onPressed: _chooseDownloadDirectory,
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('选择文件下载目录'),
+              ),
+            ],
           ),
-          const SizedBox(height: 16),
-          PanelCard(
-            title: '下载目录',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                SelectableText(
-                  _controller.hasDownloadDirectory
-                      ? _controller.downloadDirectory
-                      : '当前未设置固定下载目录',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-                const SizedBox(height: 16),
-                FilledButton.tonalIcon(
-                  onPressed: _chooseDownloadDirectory,
-                  icon: const Icon(Icons.folder_open_rounded),
-                  label: const Text('选择文件下载目录'),
-                ),
-              ],
-            ),
+        ),
+        const SizedBox(height: 16),
+        PanelCard(
+          title: '缓存管理',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                _controller.cacheBusy
+                    ? '正在统计临时内容大小...'
+                    : '当前临时内容大小: ${_controller.cacheSizeLabel}',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _controller.cacheBusy
+                        ? null
+                        : () async {
+                            final success = await _controller.clearCache();
+                            if (!mounted) {
+                              return;
+                            }
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(success ? '缓存已清除' : '缓存清除失败，请查看日志'),
+                              ),
+                            );
+                          },
+                    icon: _controller.cacheBusy
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.cleaning_services_outlined),
+                    label: const Text('一键清除缓存'),
+                  ),
+                  IconButton(
+                    onPressed: _controller.cacheBusy
+                        ? null
+                        : () {
+                            _controller.refreshCacheSize();
+                          },
+                    icon: const Icon(Icons.refresh_rounded),
+                  ),
+                ],
+              ),
+            ],
           ),
-          const SizedBox(height: 16),
-          PanelCard(
-            title: '缓存管理',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  _controller.cacheBusy
-                      ? '正在统计临时内容大小...'
-                      : '当前临时内容大小: ${_controller.cacheSizeLabel}',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    FilledButton.tonalIcon(
-                      onPressed: _controller.cacheBusy
-                          ? null
-                          : () async {
-                              final success = await _controller.clearCache();
-                              if (!mounted) {
-                                return;
-                              }
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(success ? '缓存已清除' : '缓存清除失败，请查看日志'),
-                                ),
-                              );
-                            },
-                      icon: _controller.cacheBusy
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.cleaning_services_outlined),
-                      label: const Text('一键清除缓存'),
-                    ),
-                    IconButton(
-                      onPressed: _controller.cacheBusy
-                          ? null
-                          : () {
-                              _controller.refreshCacheSize();
-                            },
-                      icon: const Icon(Icons.refresh_rounded),
-                    ),
-                  ]
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
@@ -2746,7 +3082,6 @@ class _FileManagerPageState extends State<FileManagerPage> {
   }
 
   Widget _buildFilesPanel() {
-    final entries = _browserEntries;
     if (_controller.currentFolderLoading &&
         !_controller.showingCachedFolderContent) {
       return Center(
@@ -2765,194 +3100,433 @@ class _FileManagerPageState extends State<FileManagerPage> {
       );
     }
 
-    final listChild = entries.isEmpty
-        ? ListView(
-            padding: EdgeInsets.fromLTRB(0, 16, 0, 0),
-            physics: const AlwaysScrollableScrollPhysics(),
-            children: <Widget>[
-              const SizedBox(height: 72),
-              Icon(
-                Icons.folder_open_rounded,
-                size: 56,
-                color: Colors.grey.shade400,
-              ),
-              const SizedBox(height: 12),
-              Text(
-                '当前目录没有可显示的文件或文件夹',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-            ],
-          )
-        : ListView.separated(
-            padding: EdgeInsets.fromLTRB(0, 16, 0, 0),
-            physics: const AlwaysScrollableScrollPhysics(),
-            itemCount: entries.length,
-            separatorBuilder: (_, _) => const SizedBox(height: 8),
-            itemBuilder: (context, index) {
-              final entry = entries[index];
-              if (entry.folder != null) {
-                final folder = entry.folder!;
-                return _FolderListTile(
-                  folder: folder,
-                  icon: _folderIcon(folder),
-                  selected: _controller.selectedFolderIds.contains(folder.id),
-                  onTap: () => _handleFolderTap(folder),
-                  onLongPress: () => _handleFolderLongPress(folder),
-                );
-              }
-              final file = entry.file!;
-              return ManagedFileTile(
-                file: file,
-                selected: _controller.selectedPaths.contains(file.path),
-                onTap: () => _handleFileTap(file),
-                onLongPress: () => _handleFileLongPress(file),
-              );
-            },
-          );
+    final entries = _browserEntries;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isDetail = _isDetailView(constraints);
 
-    final content = RefreshIndicator(
-      onRefresh: _refreshFiles,
-      child: Stack(
-        children: <Widget>[
-          Positioned.fill(child: listChild),
-          if (_controller.currentFolderLoading &&
-              _controller.showingCachedFolderContent)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Align(
-                  alignment: const Alignment(0, 0.55),
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.96),
-                      borderRadius: BorderRadius.circular(18),
-                      boxShadow: const <BoxShadow>[
-                        BoxShadow(
-                          color: Color(0x22000000),
-                          blurRadius: 18,
-                          offset: Offset(0, 8),
-                        ),
-                      ],
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: <Widget>[
-                          const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2.2),
-                          ),
-                          const SizedBox(width: 10),
-                          Text(
-                            '正在获取文件夹内容...',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+        if (entries.isEmpty) {
+          return _buildEmptyView();
+        }
+
+        Widget content;
+        if (isDetail) {
+          content = _buildDetailTableView();
+        } else {
+          content = _buildCardListView(entries);
+        }
+
+        content = RefreshIndicator(
+          onRefresh: _refreshFiles,
+          child: Stack(
+            children: <Widget>[
+              Positioned.fill(child: content),
+              if (_controller.currentFolderLoading &&
+                  _controller.showingCachedFolderContent)
+                _buildLoadingOverlay(),
+            ],
+          ),
+        );
+
+        if (!_supportsDesktopDrop) return content;
+
+        return DropTarget(
+          onDragEntered: (_) {
+            if (_controller.busy) return;
+            setState(() => _draggingUpload = true);
+          },
+          onDragExited: (_) {
+            if (!_draggingUpload) return;
+            setState(() => _draggingUpload = false);
+          },
+          onDragDone: (detail) async {
+            if (_draggingUpload && mounted) {
+              setState(() => _draggingUpload = false);
+            }
+            final droppedEntries = await _normalizeDroppedEntities(detail.files);
+            if (!mounted || droppedEntries.isEmpty) return;
+            await _showUploadDialog(
+              initialEntries: droppedEntries,
+              targetFolderId: _dropTargetFolderId,
+            );
+            _dropTargetFolderId = null;
+          },
+          child: Stack(
+            children: <Widget>[
+              Positioned.fill(child: content),
+              if (_draggingUpload) _buildDragOverlay(),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  bool _isDetailView(BoxConstraints constraints) =>
+      constraints.maxWidth >= constraints.maxHeight * 0.9;
+
+  Widget _buildEmptyView() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(0, 16, 0, 0),
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: <Widget>[
+        const SizedBox(height: 72),
+        Icon(Icons.folder_open_rounded, size: 56, color: Colors.grey.shade400),
+        const SizedBox(height: 12),
+        Text(
+          '当前目录没有可显示的文件或文件夹',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDetailTableView() {
+    return DetailTable(
+      files: _controller.sortedFiles,
+      folders: _sortedChildFolders,
+      selectedFilePaths: _controller.selectedPaths,
+      selectedFolderIds: _controller.selectedFolderIds,
+      batchMode: _batchMode,
+      sortColumn: _sortColumnFromName(_controller.sortColumnName),
+      sortDirection: _controller.sortAscending
+          ? SortDirection.asc
+          : SortDirection.desc,
+      columnWidths: _columnWidthsForTable(),
+      onFileTap: (file, isCtrlHeld) {
+        if (isCtrlHeld) {
+          _controller.toggleSelection(
+              file, !_controller.selectedPaths.contains(file.path));
+        } else {
+          _controller.clearSelection();
+          _controller.toggleSelection(file, true);
+        }
+      },
+      onFileDoubleTap: (file) => _showPreviewDialog(file),
+      onFolderDoubleTap: (folder) => _openFolder(folder.id),
+      onFileContextMenu: _supportsDesktopDrop
+          ? (file, position) {
+              final selected = _controller.selectedFiles;
+              if (selected.length > 1 &&
+                  selected.any((f) => f.path == file.path)) {
+                _showDesktopContextMenu(
+                    file: file, position: position,
+                    isBatch: true, selectedFiles: selected);
+              } else {
+                _showDesktopContextMenu(
+                    file: file, position: position);
+              }
+            }
+          : null,
+      onFolderContextMenu: _supportsDesktopDrop
+          ? (folder, position) {
+              final selected = _controller.selectedFolders;
+              if (selected.length > 1 &&
+                  selected.any((f) => f.id == folder.id)) {
+                _showDesktopContextMenu(
+                    folder: folder, position: position,
+                    isBatch: true, selectedFolders: selected);
+              } else {
+                _showDesktopContextMenu(
+                    folder: folder, position: position);
+              }
+            }
+          : null,
+      onToggleFileSelection: _controller.toggleSelection,
+      onToggleFolderSelection: _controller.toggleFolderSelection,
+      onSortChanged: (col) => _controller.setSortColumn(_columnName(col)),
+      onColumnWidthsChanged: (widths) {
+        final converted = <String, double>{
+          for (final e in widths.entries) _columnName(e.key): e.value,
+        };
+        _controller.saveColumnWidths(converted);
+      },
+      onDragToFolder: _supportsDesktopDrop
+          ? (folder) => _dropTargetFolderId = folder.id
+          : null,
+      onFolderHover: _supportsDesktopDrop
+          ? (folder) => _dropTargetFolderId = folder.id
+          : null,
+      onFolderUnhover: _supportsDesktopDrop
+          ? () => _dropTargetFolderId = null
+          : null,
+      isDesktop: _supportsDesktopDrop,
+      folderIcon: _folderIcon,
+    );
+  }
+
+  Widget _buildCardListView(List<_BrowserEntry> entries) {
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(0, 16, 0, 0),
+      physics: const AlwaysScrollableScrollPhysics(),
+      itemCount: entries.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
+      itemBuilder: (context, index) {
+        final entry = entries[index];
+        if (entry.folder != null) {
+          final folder = entry.folder!;
+          return _FolderListTile(
+            folder: folder,
+            icon: _folderIcon(folder),
+            selected: _controller.selectedFolderIds.contains(folder.id),
+            onTap: () => _handleFolderTap(folder),
+            onLongPress: () => _handleFolderLongPress(folder),
+          );
+        }
+        final file = entry.file!;
+        return ManagedFileTile(
+          file: file,
+          selected: _controller.selectedPaths.contains(file.path),
+          onTap: () => _handleFileTap(file),
+          onLongPress: () => _handleFileLongPress(file),
+        );
+      },
+    );
+  }
+
+  Widget _buildLoadingOverlay() {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Align(
+          alignment: const Alignment(0, 0.55),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.96),
+              borderRadius: BorderRadius.circular(18),
+              boxShadow: const <BoxShadow>[
+                BoxShadow(
+                  color: Color(0x22000000),
+                  blurRadius: 18,
+                  offset: Offset(0, 8),
                 ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2.2),
+                  ),
+                  const SizedBox(width: 10),
+                  Text('正在获取文件夹内容...',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
               ),
             ),
-        ],
+          ),
+        ),
       ),
     );
+  }
 
-    if (!_supportsDesktopDrop) {
-      return content;
+  Widget _buildDragOverlay() {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Theme.of(context)
+                .colorScheme
+                .primaryContainer
+                .withValues(alpha: 0.74),
+            border: Border.all(
+              color: Theme.of(context).colorScheme.primary,
+              width: 2,
+            ),
+          ),
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.96),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: const <BoxShadow>[
+                  BoxShadow(
+                    color: Color(0x22000000),
+                    blurRadius: 18,
+                    offset: Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const Icon(Icons.file_upload_outlined, size: 36),
+                  const SizedBox(height: 10),
+                  Text('松开以上传文件或文件夹',
+                      style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 6),
+                  Text(
+                    '将上传到 ${_controller.currentFolderPathLabel}，文件夹会保留原有层级。',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showDesktopContextMenu({
+    ManagedFile? file,
+    IndexedFolder? folder,
+    Offset? position,
+    bool isBatch = false,
+    List<ManagedFile>? selectedFiles,
+    List<IndexedFolder>? selectedFolders,
+  }) async {
+    final items = <PopupMenuEntry<String>>[];
+    if (file != null) {
+      if (isBatch && selectedFiles != null) {
+        items.addAll(_batchFileContextMenuItems(selectedFiles));
+      } else {
+        items.addAll(_fileContextMenuItems(file));
+      }
+    } else if (folder != null) {
+      if (isBatch && selectedFolders != null) {
+        items.addAll(_batchFolderContextMenuItems(selectedFolders));
+      } else {
+        items.addAll(_folderContextMenuItems(folder));
+      }
     }
 
-    return DropTarget(
-      onDragEntered: (_) {
-        if (_controller.busy) {
-          return;
-        }
-        setState(() {
-          _draggingUpload = true;
-        });
-      },
-      onDragExited: (_) {
-        if (!_draggingUpload) {
-          return;
-        }
-        setState(() {
-          _draggingUpload = false;
-        });
-      },
-      onDragDone: (detail) async {
-        if (_draggingUpload && mounted) {
-          setState(() {
-            _draggingUpload = false;
-          });
-        }
-        final droppedEntries = await _normalizeDroppedEntities(detail.files);
-        if (!mounted || droppedEntries.isEmpty) {
-          return;
-        }
-        await _showUploadDialog(initialEntries: droppedEntries);
-      },
-      child: Stack(
-        children: <Widget>[
-          Positioned.fill(child: content),
-          if (_draggingUpload)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primaryContainer
-                        .withValues(alpha: 0.74),
-                    border: Border.all(
-                      color: Theme.of(context).colorScheme.primary,
-                      width: 2,
-                    ),
-                  ),
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 16,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.96),
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: const <BoxShadow>[
-                          BoxShadow(
-                            color: Color(0x22000000),
-                            blurRadius: 18,
-                            offset: Offset(0, 8),
-                          ),
-                        ],
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: <Widget>[
-                          const Icon(Icons.file_upload_outlined, size: 36),
-                          const SizedBox(height: 10),
-                          Text(
-                            '松开以上传文件或文件夹',
-                            style: Theme.of(context).textTheme.titleSmall,
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            '将上传到 ${_controller.currentFolderPathLabel}，文件夹会保留原有层级。',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
+    // 如果已有打开的菜单，先关闭
+    if (_contextMenuOpen) {
+      final nav = Navigator.of(context);
+      nav.pop();
+      // 等待关闭动画完成
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    _contextMenuOpen = true;
+
+    final result = await showMenu<String>(
+      context: context,
+      position: position != null
+          ? RelativeRect.fromLTRB(
+              position.dx, position.dy, position.dx + 1, position.dy + 1)
+          : const RelativeRect.fromLTRB(100, 100, 101, 101),
+      items: items,
     );
+
+    _contextMenuOpen = false;
+    if (result == null) return;
+    if (file != null) {
+      if (isBatch && selectedFiles != null) {
+        await _handleBatchFileContextAction(selectedFiles, result);
+      } else {
+        await _handleFileContextAction(file, result);
+      }
+    } else if (folder != null) {
+      if (isBatch && selectedFolders != null) {
+        await _handleBatchFolderContextAction(selectedFolders, result);
+      } else {
+        await _handleFolderContextAction(folder, result);
+      }
+    }
+  }
+
+  List<PopupMenuEntry<String>> _fileContextMenuItems(ManagedFile file) => [
+    const PopupMenuItem(value: 'copyLink', child: ListTile(leading: Icon(Icons.link_rounded), title: Text('复制文件链接'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'download', child: ListTile(leading: Icon(Icons.download_rounded), title: Text('下载到目录'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'move', child: ListTile(leading: Icon(Icons.folder_open_rounded), title: Text('移动到...'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'rename', child: ListTile(leading: Icon(Icons.drive_file_rename_outline_rounded), title: Text('重命名'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'storage', child: ListTile(leading: Icon(Icons.drive_file_move_outline), title: Text('设置存储方式'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'delete', child: ListTile(leading: Icon(Icons.delete_outline_rounded, color: Color(0xFF8C2F1B)), title: Text('删除文件', style: TextStyle(color: Color(0xFF8C2F1B))), contentPadding: EdgeInsets.zero)),
+  ];
+
+  List<PopupMenuEntry<String>> _folderContextMenuItems(IndexedFolder folder) => [
+    const PopupMenuItem(value: 'open', child: ListTile(leading: Icon(Icons.folder_open_rounded), title: Text('打开文件夹'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'downloadArchive', child: ListTile(leading: Icon(Icons.archive_outlined), title: Text('下载为压缩包'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'manage', child: ListTile(leading: Icon(Icons.settings_outlined), title: Text('管理文件夹'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'moveFolder', child: ListTile(leading: Icon(Icons.drive_file_move_outline), title: Text('移动到其他文件夹'), contentPadding: EdgeInsets.zero)),
+    const PopupMenuItem(value: 'deleteFolder', child: ListTile(leading: Icon(Icons.delete_outline_rounded, color: Color(0xFF8C2F1B)), title: Text('删除文件夹', style: TextStyle(color: Color(0xFF8C2F1B))), contentPadding: EdgeInsets.zero)),
+  ];
+
+  Future<void> _handleFileContextAction(ManagedFile file, String action) async {
+    switch (action) {
+      case 'copyLink': await _copyFileLink(file);
+      case 'download': await _downloadFile(file);
+      case 'move': await _showMoveItemsToFolderDialog(files: [file]);
+      case 'rename': await _showRenameDialog(file);
+      case 'storage': await _showMoveDialog([file]);
+      case 'delete': await _confirmDeleteItems(files: [file]);
+    }
+  }
+
+  Future<void> _handleFolderContextAction(IndexedFolder folder, String action) async {
+    switch (action) {
+      case 'open': await _openFolder(folder.id);
+      case 'downloadArchive': await _downloadFolderArchive(folder);
+      case 'manage': await _showFolderManagementDialog(folder);
+      case 'moveFolder': await _showMoveItemsToFolderDialog(folders: [folder]);
+      case 'deleteFolder': await _confirmDeleteItems(folders: [folder]);
+    }
+  }
+
+  List<PopupMenuEntry<String>> _batchFileContextMenuItems(
+      List<ManagedFile> files) => [
+    PopupMenuItem(value: 'batchMove', child: ListTile(leading: const Icon(Icons.folder_open_rounded), title: Text('批量移动 (${files.length})'), contentPadding: EdgeInsets.zero)),
+    PopupMenuItem(value: 'batchStorage', child: ListTile(leading: const Icon(Icons.drive_file_move_outline), title: const Text('批量设置存储方式'), contentPadding: EdgeInsets.zero)),
+    PopupMenuItem(value: 'batchDelete', child: ListTile(leading: const Icon(Icons.delete_outline_rounded, color: Color(0xFF8C2F1B)), title: Text('批量删除 (${files.length})', style: const TextStyle(color: Color(0xFF8C2F1B))), contentPadding: EdgeInsets.zero)),
+  ];
+
+  List<PopupMenuEntry<String>> _batchFolderContextMenuItems(
+      List<IndexedFolder> folders) => [
+    PopupMenuItem(value: 'batchMoveFolder', child: ListTile(leading: const Icon(Icons.drive_file_move_outline), title: Text('批量移动 (${folders.length})'), contentPadding: EdgeInsets.zero)),
+    PopupMenuItem(value: 'batchDeleteFolder', child: ListTile(leading: const Icon(Icons.delete_outline_rounded, color: Color(0xFF8C2F1B)), title: Text('批量删除 (${folders.length})', style: const TextStyle(color: Color(0xFF8C2F1B))), contentPadding: EdgeInsets.zero)),
+  ];
+
+  Future<void> _handleBatchFileContextAction(
+      List<ManagedFile> files, String action) async {
+    switch (action) {
+      case 'batchMove':
+        await _showMoveItemsToFolderDialog(files: files);
+      case 'batchStorage':
+        await _showMoveDialog(files);
+      case 'batchDelete':
+        await _confirmDeleteItems(files: files);
+    }
+  }
+
+  Future<void> _handleBatchFolderContextAction(
+      List<IndexedFolder> folders, String action) async {
+    switch (action) {
+      case 'batchMoveFolder':
+        await _showMoveItemsToFolderDialog(folders: folders);
+      case 'batchDeleteFolder':
+        await _confirmDeleteItems(folders: folders);
+    }
+  }
+
+  // ---- 列映射辅助 ----
+  static DetailColumn? _sortColumnFromName(String? name) => switch (name) {
+    'name' => DetailColumn.name,
+    'type' => DetailColumn.type,
+    'size' => DetailColumn.size,
+    'uploadedAt' => DetailColumn.uploadedAt,
+    _ => null,
+  };
+
+  static String _columnName(DetailColumn col) => switch (col) {
+    DetailColumn.name => 'name',
+    DetailColumn.type => 'type',
+    DetailColumn.size => 'size',
+    DetailColumn.uploadedAt => 'uploadedAt',
+  };
+
+  Map<DetailColumn, double> _columnWidthsForTable() {
+    final persisted = _controller.columnWidths;
+    return <DetailColumn, double>{
+      for (final col in DetailColumn.values)
+        col: persisted[_columnName(col)] ?? 0,
+    };
   }
 
   Widget _buildHomePage() {
@@ -3129,10 +3703,12 @@ class _UploadDialogResult {
   const _UploadDialogResult({
     required this.entries,
     required this.permanent,
+    this.folderId,
   });
 
   final List<FileSystemEntity> entries;
   final bool permanent;
+  final String? folderId;
 }
 
 class _MoveToFolderDialogResult {

@@ -12,6 +12,7 @@ class Global {
   static const bool useSystemColors = true;
 
   static const String? appFontFamily = null;
+  static String? customFontFamily;
   static const _GlobalTextScale _textScale = _GlobalTextScale();
 
   static const String publicKeyPem = generatedPublicKeyPem;
@@ -52,7 +53,7 @@ class Global {
       useMaterial3: true,
       brightness: brightness,
     ).textTheme;
-    final themed = baseTheme.apply(fontFamily: appFontFamily);
+    final themed = baseTheme.apply(fontFamily: customFontFamily ?? appFontFamily);
     return themed.copyWith(
       displayLarge: _scaleTextStyle(themed.displayLarge, _textScale.displayLarge),
       displayMedium: _scaleTextStyle(themed.displayMedium, _textScale.displayMedium),

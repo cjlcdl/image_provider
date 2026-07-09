@@ -9,6 +9,7 @@ import 'package:courage_storage/models/file_list_response.dart';
 import 'package:courage_storage/models/indexed_folder.dart';
 import 'package:courage_storage/models/managed_file.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pointycastle/export.dart';
 
@@ -51,7 +52,19 @@ class TransferCancellationToken {
 
 class ImageBedClient {
   ImageBedClient({required this.baseUrl, http.Client? httpClient})
-    : _httpClient = httpClient ?? http.Client();
+    : _httpClient = httpClient ?? IOClient(_createBaseHttpClient());
+
+  /// 是否允许过期/自签名证书。默认 true（私有部署常见场景）。
+  /// 生产环境依赖公共 CA 时可设为 false。
+  static bool allowBadCertificates = true;
+
+  static HttpClient _createBaseHttpClient() {
+    final client = HttpClient();
+    if (allowBadCertificates) {
+      client.badCertificateCallback = (_, _, _) => true;
+    }
+    return client;
+  }
 
   final String baseUrl;
   final http.Client _httpClient;
@@ -400,7 +413,7 @@ class ImageBedClient {
       await partialFile.delete();
     }
 
-    final httpClient = HttpClient();
+    final httpClient = _createBaseHttpClient();
     void abortRequest() {
       httpClient.close(force: true);
     }
@@ -640,7 +653,7 @@ class ImageBedClient {
       resumedBytes = await partialFile.length();
     }
 
-    final httpClient = HttpClient();
+    final httpClient = _createBaseHttpClient();
     void abortRequest() {
       httpClient.close(force: true);
     }
@@ -746,7 +759,7 @@ class ImageBedClient {
     String relativePath, {
     TransferProgressCallback? onProgress,
   }) async {
-    final httpClient = HttpClient();
+    final httpClient = _createBaseHttpClient();
     try {
       final request = await httpClient.getUrl(_buildUri(relativePath));
       _applyHeaders(request.headers, _buildRequestHeaders());
@@ -853,6 +866,18 @@ class ImageBedClient {
       publicKey: publicKey,
     );
     return base64Encode(encryptedBytes);
+  }
+
+  /// 清理所有续传上传状态文件。通常在清空缓存时调用。
+  Future<void> clearResumableUploadStates() async {
+    try {
+      final stateDir = await _resumableUploadStateRoot();
+      if (await stateDir.exists()) {
+        await stateDir.delete(recursive: true);
+      }
+    } catch (_) {
+      // 静默失败，续传状态文件不影响核心功能
+    }
   }
 
   void close() {
@@ -996,7 +1021,7 @@ class ImageBedClient {
     );
     final suffixBytes = utf8.encode('\r\n--$boundary--\r\n');
 
-    final httpClient = HttpClient();
+    final httpClient = _createBaseHttpClient();
     void abortRequest() {
       httpClient.close(force: true);
     }
@@ -1395,7 +1420,7 @@ class ImageBedClient {
     required int end,
     TransferCancellationToken? cancelToken,
   }) async {
-    final httpClient = HttpClient();
+    final httpClient = _createBaseHttpClient();
     void abortRequest() {
       httpClient.close(force: true);
     }
