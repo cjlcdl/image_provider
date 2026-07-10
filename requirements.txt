@@ -1,0 +1,16 @@
+# ImageProvider v3.0 依赖清单
+# 元数据与数据分离架构，基于 FastAPI + SQLAlchemy + aiosqlite
+
+# Web 框架（异步支持，替代原 stdlib http.server）
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# ORM 与数据库
+sqlalchemy[asyncio]>=2.0.35
+aiosqlite>=0.20.0
+
+# RSA 加密（Courage-Token 验签 + 文件夹密码令牌解密）
+cryptography>=43.0.0
+
+# HTTP 客户端（Flutter 客户端使用，服务端无需；保留供测试参考）
+# httpx>=0.28.0

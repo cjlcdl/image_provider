@@ -82,10 +82,12 @@ class _DetailTableState extends State<DetailTable> {
   static const double _checkboxWidth = 48;
   static const double _rowHeight = 44;
   static const double _minColumnWidth = 60;
+  static const double _dividerWidth = 6;
 
   IndexedFolder? _hoveredFolder;
   Offset? _contextMenuPosition;
   double _availableWidth = 600;
+  final Map<DetailColumn, double> _dragWidths = <DetailColumn, double>{};
 
   @override
   Widget build(BuildContext context) {
@@ -143,44 +145,94 @@ class _DetailTableState extends State<DetailTable> {
           children: <Widget>[
             if (widget.batchMode)
               const SizedBox(width: _checkboxWidth, height: _rowHeight),
-            ...DetailColumn.values.map((col) {
-            final isActive = widget.sortColumn == col;
-            return _ResizableColumnHeader(
-              width: _widthFor(col),
-              minWidth: _minColumnWidth,
-              label: _columnLabel(col),
-              active: isActive,
-              ascending: widget.sortDirection == SortDirection.asc,
-              onTap: () => widget.onSortChanged(col),
-              onResized: (newWidth) {
-                final updated = Map<DetailColumn, double>.from(
-                  widget.columnWidths,
-                );
-                updated[col] = newWidth;
-                widget.onColumnWidthsChanged(updated);
-              },
-            );
-          }),
-        ],
+            ..._buildHeaderColumns(theme),
+          ],
         ),
       ),
     );
   }
 
+  List<Widget> _buildHeaderColumns(ThemeData theme) {
+    final cols = DetailColumn.values.toList();
+    final widgets = <Widget>[];
+    for (var i = 0; i < cols.length; i++) {
+      final col = cols[i];
+      final colWidth = _dragWidths[col] ?? _widthFor(col);
+      final isActive = widget.sortColumn == col;
+      widgets.add(
+        SizedBox(
+          width: colWidth,
+          child: InkWell(
+            onTap: () => widget.onSortChanged(col),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: <Widget>[
+                  Flexible(
+                    child: Text(
+                      _columnLabel(col),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontWeight:
+                            isActive ? FontWeight.w700 : FontWeight.w400,
+                      ),
+                    ),
+                  ),
+                  if (isActive)
+                    Icon(
+                      widget.sortDirection == SortDirection.asc
+                          ? Icons.arrow_upward_rounded
+                          : Icons.arrow_downward_rounded,
+                      size: 14,
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      if (i < cols.length - 1) {
+        final rightCol = cols[i + 1];
+        widgets.add(
+          _ColumnDivider(
+            key: ValueKey('divider_$rightCol'),
+            rightCol: rightCol,
+            colWidth: _dragWidths[rightCol] ?? _widthFor(rightCol),
+            onWidthUpdate: (w) => setState(() => _dragWidths[rightCol] = w),
+            onWidthCommit: (w) {
+              _dragWidths.remove(rightCol);
+              final updated = Map<DetailColumn, double>.from(widget.columnWidths);
+              updated[rightCol] = w;
+              widget.onColumnWidthsChanged(updated);
+              setState(() {});
+            },
+          ),
+        );
+      }
+    }
+    return widgets;
+  }
+
   double _widthFor(DetailColumn col) {
+    final availableTotal =
+        _availableWidth - (widget.batchMode ? _checkboxWidth : 0);
+
     if (col == DetailColumn.name) {
+      final dividerTotal =
+          _dividerWidth * (DetailColumn.values.length - 1);
       final fixedWidths = DetailColumn.values
           .where((c) => c != DetailColumn.name)
           .fold<double>(0, (sum, c) => sum + _widthFor(c));
-      final available =
-          _availableWidth -
-          (widget.batchMode ? _checkboxWidth : 0) -
-          fixedWidths;
-      return math.max(available, _minColumnWidth);
+      return math.max(
+        availableTotal - fixedWidths - dividerTotal,
+        _minColumnWidth,
+      );
     }
-    final w = widget.columnWidths[col] ?? _defaultWidth(col);
+
+    final w = _dragWidths[col] ?? widget.columnWidths[col] ?? _defaultWidth(col);
     if (w <= 0) return _defaultWidth(col);
-    return w;
+    return w.clamp(_minColumnWidth, 300.0);
   }
 
   double _defaultWidth(DetailColumn col) => switch (col) {
@@ -292,10 +344,7 @@ class _DetailTableState extends State<DetailTable> {
                       : '',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    fontFamily: 'monospace',
-                    fontSize: 11,
-                  ),
+                  style: theme.textTheme.bodySmall,
                 ),
                 _widthFor(DetailColumn.uploadedAt),
               ),
@@ -401,92 +450,55 @@ class _DetailRow {
   final IndexedFolder? folder;
 }
 
-/// 可拖拽调整宽度的列头 + 点击排序。
-class _ResizableColumnHeader extends StatefulWidget {
-  const _ResizableColumnHeader({
-    required this.width,
-    required this.minWidth,
-    required this.label,
-    required this.active,
-    required this.ascending,
-    required this.onTap,
-    required this.onResized,
+/// 列间分隔条 — 拖动调整右侧列宽。光标绝对位置为判定基准。
+class _ColumnDivider extends StatefulWidget {
+  const _ColumnDivider({
+    super.key,
+    required this.rightCol,
+    required this.colWidth,
+    required this.onWidthUpdate,
+    required this.onWidthCommit,
   });
 
-  final double width;
-  final double minWidth;
-  final String label;
-  final bool active;
-  final bool ascending;
-  final VoidCallback onTap;
-  final void Function(double) onResized;
+  final DetailColumn rightCol;
+  final double colWidth;
+  final void Function(double) onWidthUpdate;
+  final void Function(double) onWidthCommit;
 
   @override
-  State<_ResizableColumnHeader> createState() => _ResizableColumnHeaderState();
+  State<_ColumnDivider> createState() => _ColumnDividerState();
 }
 
-class _ResizableColumnHeaderState extends State<_ResizableColumnHeader> {
-  static const double _handleWidth = 6;
+class _ColumnDividerState extends State<_ColumnDivider> {
+  static const double _minWidth = 60;
+  static const double _maxWidth = 300;
+
+  double _startWidth = 0;
+  double _startX = 0;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return SizedBox(
-      width: widget.width,
-      child: Stack(
-        children: <Widget>[
-          Positioned.fill(
-            child: InkWell(
-              onTap: widget.onTap,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Row(
-                  children: <Widget>[
-                    Flexible(
-                      child: Text(
-                        widget.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          fontWeight:
-                              widget.active ? FontWeight.w700 : FontWeight.w400,
-                        ),
-                      ),
-                    ),
-                    if (widget.active)
-                      Icon(
-                        widget.ascending
-                            ? Icons.arrow_upward_rounded
-                            : Icons.arrow_downward_rounded,
-                        size: 14,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            right: 0,
-            top: 0,
-            bottom: 0,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onHorizontalDragUpdate: (details) {
-                final newWidth = (widget.width + details.delta.dx)
-                    .clamp(widget.minWidth, 600.0)
-                    .toDouble();
-                widget.onResized(newWidth);
-              },
-              child: MouseRegion(
-                cursor: SystemMouseCursors.resizeColumn,
-                child: Container(
-                  width: _handleWidth,
-                  color: Colors.transparent,
-                ),
-              ),
-            ),
-          ),
-        ],
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onHorizontalDragStart: (details) {
+        _startWidth = widget.colWidth;
+        _startX = details.globalPosition.dx;
+      },
+      onHorizontalDragUpdate: (details) {
+        final w = (_startWidth - (details.globalPosition.dx - _startX))
+            .clamp(_minWidth, _maxWidth)
+            .toDouble();
+        widget.onWidthUpdate(w);
+      },
+      onHorizontalDragEnd: (_) {
+        widget.onWidthCommit(widget.colWidth);
+      },
+      child: MouseRegion(
+        cursor: SystemMouseCursors.resizeColumn,
+        child: Container(
+          width: _DetailTableState._dividerWidth,
+          color: Colors.transparent,
+        ),
       ),
     );
   }

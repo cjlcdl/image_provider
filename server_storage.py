@@ -1,369 +1,84 @@
+"""
+存储层 v3.0 — 异步数据库操作 + 文件系统操作
+==========================================
+所有元数据操作通过 SQLAlchemy 异步会话执行，物理文件操作直接访问文件系统。
+包含：
+  - 文件元数据 CRUD（含软删除、去重、同文件夹同扩展名唯一性约束）
+  - 虚拟文件夹 CRUD（多级嵌套、密码加密、后代收集）
+  - 下载令牌管理
+  - 上传会话管理（断点续传）
+  - 审计日志写入
+  - 临时文件定时清理
+  - 频率限制与 IP 黑名单
+  - 磁盘容量查询
+"""
+
 import json
-import mimetypes
 import shutil
 import time as unix_time
-import uuid
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import server_state as state
 from config import (
-    AUDIT_LOG_FILE_PATH,
     CLEANUP_HOUR,
-    FILE_ROUTE_PREFIX,
+    DOWNLOAD_TOKEN_MAX_DAYS,
     IP_BLACKLIST,
-    PERMANENT_TOKEN_MAX_AGE_SECONDS,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
+    STORAGE_ROOT,
     UPLOAD_SESSION_MAX_AGE_SECONDS,
-    UPLOAD_SESSION_ROOT,
 )
-from server_utils import build_audit_log_line, extract_allowed_extension, now_local, safe_storage_path
+from server_utils import (
+    CHINA_TZ,
+    build_cas_path,
+    extract_extension,
+    format_utc_iso,
+    get_file_url,
+    now_local,
+    now_utc,
+    parse_file_url,
+    remove_chunk_file,
+)
 
+# SQLAlchemy 异步导入
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from server_models import AuditLog, DownloadToken, Folder, StoredFile, UploadSession
+
+
+# ===================================================================
+# 存储目录初始化
+# ===================================================================
 
 def ensure_storage() -> None:
-    state.TEMP_UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    state.PERMANENT_UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    AUDIT_LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    UPLOAD_SESSION_ROOT.mkdir(parents=True, exist_ok=True)
+    """确保所有存储目录存在"""
+    from config import CHUNK_STORAGE_ROOT, FILES_STORAGE_ROOT
 
+    STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    FILES_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    CHUNK_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
 
-def read_last_cleanup_date() -> Optional[str]:
-    if not state.STATE_FILE.exists():
-        return None
-    return state.STATE_FILE.read_text(encoding="utf-8").strip() or None
 
-
-def write_last_cleanup_date(cleanup_date: str) -> None:
-    state.STATE_FILE.write_text(cleanup_date, encoding="utf-8")
-
-
-def save_permanent_index() -> None:
-    temp_index_file = state.PERMANENT_INDEX_FILE.with_suffix(".tmp")
-    temp_index_file.write_text(
-        json.dumps({"files": state.permanent_file_index}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    temp_index_file.replace(state.PERMANENT_INDEX_FILE)
-
-
-def load_permanent_index() -> None:
-    if not state.PERMANENT_INDEX_FILE.exists():
-        return
-
-    try:
-        payload = json.loads(state.PERMANENT_INDEX_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return
-
-    records = payload.get("files", {}) if isinstance(payload, dict) else {}
-    if not isinstance(records, dict):
-        return
-
-    with state.index_lock:
-        state.permanent_file_index.clear()
-        for relative_path, metadata in records.items():
-            if isinstance(relative_path, str) and isinstance(metadata, dict):
-                state.permanent_file_index[relative_path] = metadata
-
-
-def clear_temporary_index() -> None:
-    with state.index_lock:
-        state.temporary_file_index.clear()
-
-
-def upload_session_metadata_path(upload_id: str) -> Path:
-    return UPLOAD_SESSION_ROOT / "{}.json".format(upload_id)
-
-
-def upload_session_part_path(upload_id: str) -> Path:
-    return UPLOAD_SESSION_ROOT / "{}.part".format(upload_id)
-
-
-def remove_upload_session_files(upload_id: str) -> None:
-    upload_session_metadata_path(upload_id).unlink(missing_ok=True)
-    upload_session_part_path(upload_id).unlink(missing_ok=True)
-
-
-def save_upload_session_record(record: Dict[str, Any]) -> None:
-    upload_id = str(record["uploadId"])
-    metadata_path = upload_session_metadata_path(upload_id)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = metadata_path.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    temp_path.replace(metadata_path)
-
-
-def load_upload_session_record(upload_id: str) -> Optional[Dict[str, Any]]:
-    metadata_path = upload_session_metadata_path(upload_id)
-    if not metadata_path.exists():
-        return None
-
-    try:
-        record = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(record, dict):
-        return None
-
-    if record.get("status") == "uploading":
-        part_path = upload_session_part_path(upload_id)
-        actual_size = part_path.stat().st_size if part_path.exists() else 0
-        if int(record.get("uploadedSize", 0)) != actual_size:
-            record["uploadedSize"] = actual_size
-            record["updatedAt"] = now_local().isoformat()
-            save_upload_session_record(record)
-
-    return record
-
-
-def is_upload_session_expired(record: Dict[str, Any]) -> bool:
-    updated_at = record.get("updatedAt") or record.get("createdAt")
-    if not isinstance(updated_at, str) or not updated_at:
-        return True
-
-    try:
-        updated_at_value = datetime.fromisoformat(updated_at)
-    except ValueError:
-        return True
-
-    age_seconds = (now_local() - updated_at_value).total_seconds()
-    return age_seconds > UPLOAD_SESSION_MAX_AGE_SECONDS
-
-
-def cleanup_expired_upload_sessions() -> int:
-    ensure_storage()
-    removed_count = 0
-    for metadata_path in UPLOAD_SESSION_ROOT.glob("*.json"):
-        try:
-            record = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            record = None
-
-        upload_id = metadata_path.stem
-        if not isinstance(record, dict) or is_upload_session_expired(record):
-            remove_upload_session_files(upload_id)
-            removed_count += 1
-
-    return removed_count
-
-
-def build_upload_session_record(
-    *,
-    storage_type: str,
-    indexed_name: str,
-    system_name: str,
-    relative_path: str,
-    total_size: int,
-    mime_type: str,
-    folder_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    timestamp = now_local().isoformat()
-    return {
-        "uploadId": uuid.uuid4().hex,
-        "uploadToken": __import__("secrets").token_urlsafe(32),
-        "status": "uploading",
-        "storage": storage_type,
-        "indexedName": indexed_name,
-        "systemName": system_name,
-        "relativePath": relative_path,
-        "totalSize": total_size,
-        "uploadedSize": 0,
-        "mimeType": mime_type,
-        "folderId": folder_id,
-        "createdAt": timestamp,
-        "updatedAt": timestamp,
-    }
-
-
-def get_index_store(storage_type: str) -> Dict[str, Dict[str, Any]]:
-    if storage_type == "permanent":
-        return state.permanent_file_index
-    return state.temporary_file_index
-
-
-def upsert_file_index_record(
-    storage_type: str,
-    relative_path: str,
-    system_name: str,
-    indexed_name: str,
-    file_size: int,
-    mime_type: str,
-    folder_id: Optional[str] = None,
-    uploaded_at: Optional[str] = None,
-) -> Dict[str, Any]:
-    existing_record = get_file_index_record(storage_type, relative_path) or {}
-    record = {
-        "indexedName": indexed_name,
-        "systemName": system_name,
-        "size": file_size,
-        "mimeType": mime_type,
-        "uploadedAt": uploaded_at or existing_record.get("uploadedAt") or now_local().isoformat(),
-        "folderId": folder_id if folder_id is not None else existing_record.get("folderId"),
-    }
-
-    with state.index_lock:
-        index_store = get_index_store(storage_type)
-        index_store[relative_path] = record
-        if storage_type == "permanent":
-            save_permanent_index()
-
-    return record
-
-
-def remove_file_index_record(storage_type: str, relative_path: str) -> None:
-    with state.index_lock:
-        index_store = get_index_store(storage_type)
-        index_store.pop(relative_path, None)
-        if storage_type == "permanent":
-            save_permanent_index()
-
-
-def rename_file_index_record(storage_type: str, relative_path: str, indexed_name: str) -> Optional[Dict[str, Any]]:
-    with state.index_lock:
-        index_store = get_index_store(storage_type)
-        record = index_store.get(relative_path)
-        if record is None:
-            return None
-        record["indexedName"] = indexed_name
-        if storage_type == "permanent":
-            save_permanent_index()
-        return dict(record)
-
-
-def get_file_index_record(storage_type: str, relative_path: str) -> Optional[Dict[str, Any]]:
-    with state.index_lock:
-        record = get_index_store(storage_type).get(relative_path)
-        if record is None:
-            return None
-        return dict(record)
-
-
-def set_file_index_folder(storage_type: str, relative_path: str, folder_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    with state.index_lock:
-        index_store = get_index_store(storage_type)
-        record = index_store.get(relative_path)
-        if record is None:
-            return None
-        record["folderId"] = folder_id
-        if storage_type == "permanent":
-            save_permanent_index()
-        return dict(record)
-
-
-def prune_missing_permanent_index_records() -> bool:
-    removed = False
-    with state.index_lock:
-        stale_paths = []
-        for relative_path in state.permanent_file_index.keys():
-            resolved = resolve_relative_path(relative_path)
-            if resolved is None or not resolved[1].exists():
-                stale_paths.append(relative_path)
-
-        for relative_path in stale_paths:
-            state.permanent_file_index.pop(relative_path, None)
-            removed = True
-
-        if removed:
-            save_permanent_index()
-
-    return removed
-
-
-def cleanup_uploaded_files() -> int:
-    ensure_storage()
-    removed_count = 0
-
-    with state.cleanup_lock:
-        for child in state.TEMP_UPLOAD_ROOT.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-                removed_count += 1
-            else:
-                child.unlink()
-                removed_count += 1
-
-        clear_used_nonces()
-        clear_temporary_index()
-        write_last_cleanup_date(now_local().date().isoformat())
-
-    return removed_count
-
-
-def cleanup_if_due() -> None:
-    current = now_local()
-    today = current.date()
-    cleanup_time = datetime.combine(today, time(hour=CLEANUP_HOUR), tzinfo=current.tzinfo)
-    last_cleanup = read_last_cleanup_date()
-
-    if current >= cleanup_time and last_cleanup != today.isoformat():
-        cleanup_uploaded_files()
-
-
-def next_cleanup_at(reference: datetime) -> datetime:
-    target = datetime.combine(reference.date(), time(hour=CLEANUP_HOUR), tzinfo=reference.tzinfo)
-    if reference >= target:
-        target += timedelta(days=1)
-    return target
-
-
-def cleanup_scheduler() -> None:
-    try:
-        cleanup_if_due()
-    except Exception as exc:
-        print("cleanup startup check failed: {}".format(exc))
-
-    while not state.shutdown_event.is_set():
-        current = now_local()
-        target = next_cleanup_at(current)
-        wait_seconds = max(1, int((target - current).total_seconds()))
-        if state.shutdown_event.wait(wait_seconds):
-            break
-        try:
-            cleanup_uploaded_files()
-        except Exception as exc:
-            print("cleanup scheduler failed: {}".format(exc))
-
-
-def prune_used_nonces(reference_ts: Optional[int] = None) -> bool:
-    if reference_ts is None:
-        reference_ts = int(unix_time.time())
-
-    expired_nonces = [
-        nonce for nonce, expires_at in state.used_nonce_expirations.items() if expires_at <= reference_ts
-    ]
-    for nonce in expired_nonces:
-        state.used_nonce_expirations.pop(nonce, None)
-    return bool(expired_nonces)
-
-
-def clear_used_nonces() -> None:
-    with state.nonce_lock:
-        state.used_nonce_expirations.clear()
-
-
-def reserve_nonce(nonce: str) -> bool:
-    current_ts = int(unix_time.time())
-    with state.nonce_lock:
-        prune_used_nonces(current_ts)
-        expires_at = state.used_nonce_expirations.get(nonce)
-        if expires_at is not None and expires_at > current_ts:
-            return False
-        state.used_nonce_expirations[nonce] = current_ts + PERMANENT_TOKEN_MAX_AGE_SECONDS
-    return True
-
+# ===================================================================
+# 频率限制与 IP 黑名单（同步，内存操作）
+# ===================================================================
 
 def is_ip_blacklisted(client_ip: str) -> bool:
+    """检查 IP 是否在黑名单中"""
     return client_ip in IP_BLACKLIST
 
 
 def is_rate_limited(client_ip: str) -> bool:
+    """检查客户端 IP 是否超过上传频率限制（滑动时间窗口）"""
     current_window = int(unix_time.time()) // RATE_LIMIT_WINDOW_SECONDS
     with state.rate_limit_lock:
         stale_ips = [
-            ip for ip, bucket in state.upload_rate_windows.items() if bucket["window"] != current_window
+            ip
+            for ip, bucket in state.upload_rate_windows.items()
+            if bucket["window"] != current_window
         ]
         for ip in stale_ips:
             state.upload_rate_windows.pop(ip, None)
@@ -372,235 +87,908 @@ def is_rate_limited(client_ip: str) -> bool:
         if bucket is None:
             state.upload_rate_windows[client_ip] = {"window": current_window, "count": 1}
             return False
-
         if bucket["count"] >= RATE_LIMIT_MAX_REQUESTS:
             return True
-
         bucket["count"] += 1
         return False
 
 
-def resolve_relative_path(relative_path: str) -> Optional[Tuple[str, Path, str]]:
-    if not relative_path.startswith(FILE_ROUTE_PREFIX + "/"):
-        return None
+# ===================================================================
+# 磁盘容量
+# ===================================================================
 
-    route_path = relative_path[len(FILE_ROUTE_PREFIX) :].lstrip("/")
-    if not route_path:
-        return None
-
-    if route_path.startswith("permanent/"):
-        storage_type = "permanent"
-        target_path = safe_storage_path(state.PERMANENT_UPLOAD_ROOT, route_path[len("permanent/") :])
-    else:
-        storage_type = "temporary"
-        target_path = safe_storage_path(state.TEMP_UPLOAD_ROOT, route_path)
-
-    if target_path is None:
-        return None
-    return storage_type, target_path, relative_path
-
-
-def build_file_item(storage_type: str, relative_path: str, target_path: Path) -> Dict[str, Any]:
-    mime_type = mimetypes.guess_type(target_path.name)[0] or "application/octet-stream"
-    record = get_file_index_record(storage_type, relative_path) or {}
-    indexed_name = record.get("indexedName") or target_path.name
-    uploaded_at = record.get("uploadedAt")
-    folder_id = record.get("folderId") if isinstance(record.get("folderId"), str) else None
-
+def get_disk_capacity() -> Dict[str, int]:
+    """获取存储磁盘的总量、已用量、可用量（字节）"""
+    total, used, free = shutil.disk_usage(str(STORAGE_ROOT.resolve()))
     return {
-        "indexedName": indexed_name,
-        "systemName": target_path.name,
-        "storage": storage_type,
-        "size": target_path.stat().st_size,
-        "mimeType": mime_type,
-        "path": relative_path,
-        "url": relative_path,
-        "uploadedAt": uploaded_at,
-        "folderId": folder_id,
+        "diskTotalBytes": int(total),
+        "diskUsedBytes": int(used),
+        "diskFreeBytes": int(free),
     }
 
 
-def list_all_files() -> list:
-    prune_missing_permanent_index_records()
-    files = []
+# ===================================================================
+# 清理日期状态管理
+# ===================================================================
 
-    if state.TEMP_UPLOAD_ROOT.exists():
-        for folder in sorted(state.TEMP_UPLOAD_ROOT.iterdir()):
-            if not folder.is_dir():
-                continue
-            for child in sorted(folder.iterdir()):
-                if not child.is_file():
-                    continue
-                relative_path = "{}/{}/{}".format(FILE_ROUTE_PREFIX, folder.name, child.name)
-                files.append(build_file_item("temporary", relative_path, child))
-
-    if state.PERMANENT_UPLOAD_ROOT.exists():
-        for child in sorted(state.PERMANENT_UPLOAD_ROOT.iterdir()):
-            if not child.is_file():
-                continue
-            relative_path = "{}/permanent/{}".format(FILE_ROUTE_PREFIX, child.name)
-            files.append(build_file_item("permanent", relative_path, child))
-
-    files.sort(key=lambda item: (item.get("storage", ""), item.get("path", "")))
-    return files
+def read_last_cleanup_date() -> Optional[str]:
+    """读取上次清理日期"""
+    if not state.STATE_FILE.exists():
+        return None
+    return state.STATE_FILE.read_text(encoding="utf-8").strip() or None
 
 
-def apply_file_filters(
-    files: list,
+def write_last_cleanup_date(cleanup_date: str) -> None:
+    """写入清理日期"""
+    state.STATE_FILE.write_text(cleanup_date, encoding="utf-8")
+
+
+# ===================================================================
+# 文件元数据 CRUD（异步）
+# ===================================================================
+
+async def create_file_record(
+    db: AsyncSession,
+    *,
+    indexed_name: str,
+    system_name: str,
+    storage: str,
+    size: int,
+    mime_type: str,
+    sha256: str,
+    extension: str,
+    folder_id: str = "",
+    uploaded_by: Optional[str] = None,
+    app_channel: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
+) -> StoredFile:
+    """创建文件元数据记录
+
+    插入后由 after_insert 事件自动生成 12 位 base62 file_id。
+    """
+    record = StoredFile(
+        indexed_name=indexed_name,
+        system_name=system_name,
+        storage=storage,
+        size=size,
+        mime_type=mime_type,
+        sha256=sha256,
+        extension=extension,
+        folder_id=folder_id,
+        uploaded_by=uploaded_by,
+        app_channel=app_channel,
+        created_at=now_utc(),
+        expires_at=expires_at,
+    )
+    db.add(record)
+    await db.flush()  # 触发 after_insert → 生成 file_id
+    return record
+
+
+async def get_file_by_id(db: AsyncSession, file_id: str) -> Optional[StoredFile]:
+    """通过 12 位短 file_id 查询文件（排除已软删除）"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_file_by_system_name(db: AsyncSession, system_name: str) -> Optional[StoredFile]:
+    """通过系统文件名（sha256.ext）查询文件（排除已软删除）"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.system_name == system_name,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_file_by_url(db: AsyncSession, url_path: str) -> Optional[StoredFile]:
+    """通过 /p/{base64url} URL 路径解析并查询文件"""
+    system_name = parse_file_url(url_path)
+    if system_name is None:
+        return None
+    return await get_file_by_system_name(db, system_name)
+
+
+async def check_duplicate_name(
+    db: AsyncSession,
+    indexed_name: str,
+    folder_id: str,
+    extension: str,
+    exclude_file_id: Optional[str] = None,
+) -> bool:
+    """检查同文件夹下是否已存在同扩展名的同名文件
+
+    用于上传/重命名前的唯一性校验（模拟真实文件系统行为）。
+    """
+    conditions = [
+        StoredFile.indexed_name == indexed_name,
+        StoredFile.folder_id == folder_id,
+        StoredFile.extension == extension,
+        StoredFile.deleted_at.is_(None),
+    ]
+    if exclude_file_id:
+        conditions.append(StoredFile.file_id != exclude_file_id)
+
+    result = await db.execute(select(StoredFile).where(and_(*conditions)))
+    return result.scalar_one_or_none() is not None
+
+
+async def check_sha256_exists(db: AsyncSession, sha256: str) -> Optional[StoredFile]:
+    """检查相同 SHA-256 哈希的文件是否已存在（用于去重）
+
+    返回任意一条匹配记录即可——物理文件只需存一份。
+    """
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.sha256 == sha256,
+            StoredFile.deleted_at.is_(None),
+        ).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_files_query(
+    db: AsyncSession,
+    *,
     storage_filter: Optional[str] = None,
     keyword: Optional[str] = None,
     mime_type: Optional[str] = None,
     extension: Optional[str] = None,
     folder_id: Optional[str] = None,
-) -> list:
-    filtered_files = files
+    page: int = 1,
+    page_size: int = 50,
+    include_deleted: bool = False,
+) -> Tuple[List[StoredFile], int]:
+    """分页查询文件列表（支持多条件筛选）
 
+    Args:
+        storage_filter: 按存储类型筛选 (temporary/permanent)
+        keyword: 按文件名模糊搜索（匹配 indexed_name、system_name、file_id）
+        mime_type: 按 MIME 类型精确筛选
+        extension: 按扩展名筛选（不含点号）
+        folder_id: 按文件夹筛选（None=全部, ""=根目录, 具体ID=该文件夹）
+        page: 页码（从 1 开始）
+        page_size: 每页条数（最大 200）
+        include_deleted: 仅显示已删除文件（回收站模式），默认 False 仅显示未删除文件
+
+    Returns:
+        (文件列表, 总记录数)
+    """
+    conditions = []
+    if include_deleted:
+        conditions.append(StoredFile.deleted_at.isnot(None))
+    else:
+        conditions.append(StoredFile.deleted_at.is_(None))
     if storage_filter:
-        filtered_files = [item for item in filtered_files if item.get("storage") == storage_filter]
-
-    if keyword:
-        keyword_lower = keyword.lower()
-        filtered_files = [
-            item
-            for item in filtered_files
-            if keyword_lower in str(item.get("indexedName", "")).lower()
-            or keyword_lower in str(item.get("systemName", "")).lower()
-            or keyword_lower in str(item.get("path", "")).lower()
-        ]
-
+        conditions.append(StoredFile.storage == storage_filter)
     if mime_type:
-        filtered_files = [item for item in filtered_files if item.get("mimeType") == mime_type]
-
+        conditions.append(StoredFile.mime_type == mime_type)
     if extension:
-        normalized_extension = extension.lower().lstrip(".")
-        filtered_files = [
-            item
-            for item in filtered_files
-            if str(item.get("systemName", "")).lower().endswith("." + normalized_extension)
-        ]
-
+        normalized_ext = f".{extension.lower().lstrip('.')}"
+        conditions.append(StoredFile.extension == normalized_ext)
     if folder_id is not None:
-        if folder_id == "root":
-            filtered_files = [item for item in filtered_files if not item.get("folderId")]
-        else:
-            filtered_files = [item for item in filtered_files if item.get("folderId") == folder_id]
+        conditions.append(StoredFile.folder_id == folder_id)
+    if keyword:
+        kw = f"%{keyword.lower()}%"
+        conditions.append(
+            or_(
+                StoredFile.indexed_name.ilike(kw),
+                StoredFile.system_name.ilike(kw),
+                StoredFile.file_id.ilike(kw),
+            )
+        )
 
-    return filtered_files
+    # 总数查询
+    count_q = select(func.count()).select_from(StoredFile)
+    if conditions:
+        count_q = count_q.where(and_(*conditions))
+    total = (await db.execute(count_q)).scalar() or 0
 
+    # 分页查询
+    query = select(StoredFile).order_by(StoredFile.created_at.desc())
+    if conditions:
+        query = query.where(and_(*conditions))
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    rows = (await db.execute(query)).scalars().all()
 
-def paginate_files(files: list, page: int, page_size: int) -> Tuple[list, int]:
-    total = len(files)
-    start_index = (page - 1) * page_size
-    end_index = start_index + page_size
-    return files[start_index:end_index], total
-
-
-def delete_file_by_relative_path(relative_path: str) -> Tuple[bool, Dict[str, Any]]:
-    resolved = resolve_relative_path(relative_path)
-    if resolved is None:
-        return False, {"path": relative_path, "reason": "file not found"}
-
-    storage_type, target_path, normalized_path = resolved
-    if not target_path.exists() or not target_path.is_file():
-        remove_file_index_record(storage_type, normalized_path)
-        return False, {"path": normalized_path, "reason": "file not found"}
-
-    target_path.unlink()
-    remove_file_index_record(storage_type, normalized_path)
-    if storage_type == "temporary" and target_path.parent.exists() and not any(target_path.parent.iterdir()):
-        target_path.parent.rmdir()
-
-    return True, {"path": normalized_path, "storage": storage_type}
+    return list(rows), total
 
 
-def generate_storage_file_name(target_storage: str, extension: str) -> str:
-    normalized_extension = ""
-    if extension:
-        normalized_extension = extension if extension.startswith(".") else "." + extension
-    if target_storage == "permanent":
-        return "{}_{}{}".format(int(unix_time.time()), uuid.uuid4().hex[:16], normalized_extension)
-    return "{}{}".format(uuid.uuid4().hex, normalized_extension)
+async def soft_delete_file(db: AsyncSession, file_id: str) -> bool:
+    """软删除文件：设置 deleted_at 时间戳，不删除物理文件"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return False
+    record.deleted_at = now_utc()
+    await db.flush()
+    return True
 
 
-def build_relative_url_for_storage(target_storage: str, file_name: str) -> str:
-    if target_storage == "permanent":
-        return "{}/permanent/{}".format(FILE_ROUTE_PREFIX, file_name)
-    folder_name = now_local().strftime("%Y%m%d")
-    return "{}/{}/{}".format(FILE_ROUTE_PREFIX, folder_name, file_name)
+async def permanent_delete_file(db: AsyncSession, file_id: str) -> Optional[StoredFile]:
+    """永久删除文件：删除元数据记录。
+
+    物理文件仅在没有其他记录引用同一 SHA-256 时才删除（去重保护）。
+    """
+    result = await db.execute(
+        select(StoredFile).where(StoredFile.file_id == file_id)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+
+    sha256 = record.sha256
+    system_name = record.system_name
+
+    await db.delete(record)
+    await db.flush()
+
+    # 无其他引用才删物理文件
+    ref_result = await db.execute(
+        select(func.count()).select_from(StoredFile).where(
+            StoredFile.sha256 == sha256,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    if (ref_result.scalar() or 0) == 0:
+        ext = extract_extension(system_name)
+        target_path, _ = build_cas_path(sha256, ext)
+        if target_path.exists():
+            target_path.unlink()
+        shard_dir = target_path.parent
+        if shard_dir.exists() and not any(shard_dir.iterdir()):
+            shard_dir.rmdir()
+
+    return record
 
 
-def move_file_by_relative_path(relative_path: str, target_storage: str) -> Tuple[bool, Dict[str, Any]]:
-    resolved = resolve_relative_path(relative_path)
-    if resolved is None:
-        return False, {"path": relative_path, "reason": "file not found"}
+async def restore_file(db: AsyncSession, file_id: str) -> Optional[StoredFile]:
+    """恢复软删除的文件：清除 deleted_at 时间戳"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.isnot(None),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    record.deleted_at = None
+    await db.flush()
+    return record
 
-    source_storage, source_path, normalized_path = resolved
-    if not source_path.exists() or not source_path.is_file():
-        remove_file_index_record(source_storage, normalized_path)
-        return False, {"path": normalized_path, "reason": "file not found"}
 
+async def rename_file(db: AsyncSession, file_id: str, new_indexed_name: str) -> Optional[StoredFile]:
+    """重命名文件（更新 indexed_name，检查同名冲突）"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+
+    new_ext = extract_extension(new_indexed_name) or record.extension
+    if await check_duplicate_name(db, new_indexed_name, record.folder_id, new_ext, exclude_file_id=file_id):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="file name already exists in this folder")
+
+    record.indexed_name = new_indexed_name
+    if new_ext != record.extension:
+        record.extension = new_ext
+    await db.flush()
+    return record
+
+
+async def move_file_storage(db: AsyncSession, file_id: str, target_storage: str) -> Optional[StoredFile]:
+    """切换文件存储类型（temporary ↔ permanent）"""
     if target_storage not in ("temporary", "permanent"):
-        return False, {"path": normalized_path, "reason": "invalid target storage"}
+        return None
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    record.storage = target_storage
+    if target_storage == "permanent":
+        record.expires_at = None
+    await db.flush()
+    return record
 
-    file_size = source_path.stat().st_size
-    mime_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
-    indexed_record = get_file_index_record(source_storage, normalized_path) or {}
-    indexed_name = indexed_record.get("indexedName") or source_path.name
-    uploaded_at = indexed_record.get("uploadedAt") or now_local().isoformat()
-    folder_id = indexed_record.get("folderId") if isinstance(indexed_record.get("folderId"), str) else None
 
-    if source_storage == target_storage:
-        return True, {
-            "path": normalized_path,
-            "sourceStorage": source_storage,
-            "targetStorage": target_storage,
-            "indexedName": indexed_name,
-            "mimeType": mime_type,
-            "size": file_size,
-        }
+async def set_file_folder(db: AsyncSession, file_id: str, folder_id: str) -> Optional[StoredFile]:
+    """调整文件所属文件夹"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.file_id == file_id,
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    record.folder_id = folder_id
+    await db.flush()
+    return record
 
-    extension = Path(source_path.name).suffix or extract_allowed_extension(source_path.name) or ""
 
-    target_file_name = generate_storage_file_name(target_storage, extension)
-    target_relative_url = build_relative_url_for_storage(target_storage, target_file_name)
-    target_resolved = resolve_relative_path(target_relative_url)
-    if target_resolved is None:
-        return False, {"path": normalized_path, "reason": "failed to resolve target path"}
+async def record_file_access(db: AsyncSession, file_id: str) -> None:
+    """更新文件的最后访问时间和访问计数"""
+    await db.execute(
+        update(StoredFile)
+        .where(StoredFile.file_id == file_id)
+        .values(
+            last_accessed_at=now_utc(),
+            access_count=StoredFile.access_count + 1,
+        )
+    )
+    await db.flush()
 
-    _resolved_storage, target_path, normalized_target_path = target_resolved
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source_path), str(target_path))
 
-    with state.index_lock:
-        source_store = get_index_store(source_storage)
-        target_store = get_index_store(target_storage)
-        source_store.pop(normalized_path, None)
-        target_store[normalized_target_path] = {
-            "indexedName": indexed_name,
-            "systemName": target_file_name,
-            "size": file_size,
-            "mimeType": mime_type,
-            "uploadedAt": uploaded_at,
-            "folderId": folder_id,
-        }
-        if source_storage == "permanent" or target_storage == "permanent":
-            save_permanent_index()
-
-    if source_storage == "temporary" and source_path.parent.exists() and not any(source_path.parent.iterdir()):
-        source_path.parent.rmdir()
-
-    return True, {
-        "path": normalized_target_path,
-        "sourceStorage": source_storage,
-        "targetStorage": target_storage,
-        "indexedName": indexed_name,
-        "mimeType": mime_type,
-        "size": file_size,
+def build_file_response(record: StoredFile) -> Dict[str, Any]:
+    """将 StoredFile ORM 对象转换为 API 响应字典"""
+    url = get_file_url(record.system_name)
+    return {
+        "fileId": record.file_id,
+        "indexedName": record.indexed_name,
+        "systemName": record.system_name,
+        "storage": record.storage,
+        "size": record.size,
+        "mimeType": record.mime_type,
+        "sha256": record.sha256,
+        "extension": record.extension,
+        "path": url,
+        "url": url,
+        "folderId": record.folder_id or None,
+        "uploadedBy": record.uploaded_by,
+        "appChannel": record.app_channel,
+        "createdAt": format_utc_iso(record.created_at),
+        "uploadedAt": format_utc_iso(record.created_at),
+        "deletedAt": format_utc_iso(record.deleted_at),
+        "lastAccessedAt": format_utc_iso(record.last_accessed_at),
+        "accessCount": record.access_count,
+        "isDeleted": record.deleted_at is not None,
     }
 
 
-def append_audit_log(log_line: str) -> None:
-    with state.audit_log_lock:
-        with AUDIT_LOG_FILE_PATH.open("a", encoding="utf-8") as file_obj:
-            file_obj.write(log_line)
-            file_obj.write("\n")
+# ===================================================================
+# 虚拟文件夹 CRUD（异步，替代原 folder_index.py）
+# ===================================================================
+
+async def create_folder_record(
+    db: AsyncSession,
+    *,
+    name: str,
+    parent_id: Optional[str] = None,
+    encrypted: bool = False,
+    password: Optional[str] = None,
+    allow_direct_download: bool = True,
+) -> Folder:
+    """创建虚拟文件夹
+
+    Args:
+        name: 文件夹名称
+        parent_id: 父文件夹 ID（None 表示根级）
+        encrypted: 是否加密
+        password: 加密密码（encrypted=True 时必填）
+        allow_direct_download: 是否允许直接下载
+
+    Returns:
+        新创建的 Folder ORM 对象
+
+    Raises:
+        PermissionError: 加密文件夹未提供密码
+    """
+    import uuid
+
+    from server_auth import _generate_password_hash
+
+    if encrypted and not password:
+        raise PermissionError("missing folder password")
+
+    folder_id = uuid.uuid4().hex
+    now_ts = now_utc()
+
+    record = Folder(
+        id=folder_id,
+        name=name,
+        parent_id=parent_id,
+        encrypted=encrypted,
+        allow_direct_download=allow_direct_download if encrypted else True,
+        created_at=now_ts,
+        updated_at=now_ts,
+    )
+    if encrypted and password:
+        pw_data = _generate_password_hash(password)
+        record.password_salt = pw_data["passwordSalt"]
+        record.password_hash = pw_data["passwordHash"]
+
+    db.add(record)
+    await db.flush()
+    return record
+
+
+async def get_folder_record(db: AsyncSession, folder_id: str) -> Optional[Folder]:
+    """按 ID 查询文件夹"""
+    result = await db.execute(select(Folder).where(Folder.id == folder_id))
+    return result.scalar_one_or_none()
+
+
+async def list_all_folders(db: AsyncSession) -> List[Folder]:
+    """列出所有文件夹"""
+    result = await db.execute(select(Folder).order_by(Folder.name))
+    return list(result.scalars().all())
+
+
+async def collect_descendant_folder_ids(db: AsyncSession, folder_id: str) -> List[str]:
+    """广度优先收集某文件夹的所有后代文件夹 ID"""
+    descendants: List[str] = []
+    pending = [folder_id]
+    while pending:
+        current = pending.pop(0)
+        result = await db.execute(select(Folder.id).where(Folder.parent_id == current))
+        child_ids = [row[0] for row in result.all()]
+        descendants.extend(child_ids)
+        pending.extend(child_ids)
+    return descendants
+
+
+async def update_folder_record(
+    db: AsyncSession,
+    folder_id: str,
+    *,
+    name: Optional[str] = None,
+    parent_id: Optional[str] = None,
+    parent_id_provided: bool = False,
+    encrypted: Optional[bool] = None,
+    allow_direct_download: Optional[bool] = None,
+    password: Optional[str] = None,
+) -> Optional[Folder]:
+    """更新文件夹属性
+
+    Returns:
+        更新后的 Folder 对象，文件夹不存在时返回 None
+
+    Raises:
+        ValueError: 无效的文件夹名或循环引用
+        PermissionError: 加密操作缺少密码
+    """
+    from server_auth import _generate_password_hash
+    from server_utils import sanitize_index_name as sanitize_folder_name
+
+    result = await db.execute(select(Folder).where(Folder.id == folder_id))
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+
+    # 更新名称
+    if name is not None:
+        normalized = sanitize_folder_name(name)
+        if normalized is None:
+            raise ValueError("invalid folder name")
+        record.name = normalized
+
+    # 更新父目录（含循环引用检查）
+    if parent_id_provided:
+        new_parent = parent_id or None  # None 表示移到根级
+        if new_parent == folder_id:
+            raise ValueError("invalid target parent")
+        if new_parent:
+            descendants = await collect_descendant_folder_ids(db, folder_id)
+            if new_parent in descendants:
+                raise ValueError("invalid target parent")
+            # 验证目标父目录存在
+            parent_result = await db.execute(select(Folder).where(Folder.id == new_parent))
+            if parent_result.scalar_one_or_none() is None:
+                raise KeyError("target parent folder not found")
+        record.parent_id = new_parent
+
+    # 更新加密状态
+    if encrypted is not None:
+        record.encrypted = encrypted
+        if encrypted:
+            if not password:
+                raise PermissionError("missing folder password")
+            pw_data = _generate_password_hash(password)
+            record.password_salt = pw_data["passwordSalt"]
+            record.password_hash = pw_data["passwordHash"]
+            if allow_direct_download is not None:
+                record.allow_direct_download = allow_direct_download
+        else:
+            record.password_salt = None
+            record.password_hash = None
+            record.allow_direct_download = True
+    elif allow_direct_download is not None:
+        record.allow_direct_download = allow_direct_download
+
+    # 单独修改密码（加密状态不变）
+    if encrypted is None and password:
+        if not record.encrypted:
+            raise ValueError("folder is not encrypted")
+        pw_data = _generate_password_hash(password)
+        record.password_salt = pw_data["passwordSalt"]
+        record.password_hash = pw_data["passwordHash"]
+
+    record.updated_at = now_utc()
+    await db.flush()
+    return record
+
+
+async def delete_folder_cascade(db: AsyncSession, folder_id: str) -> List[str]:
+    """级联删除文件夹及其所有后代文件夹
+
+    Returns:
+        被删除的所有文件夹 ID 列表
+    """
+    descendants = await collect_descendant_folder_ids(db, folder_id)
+    all_ids = [folder_id] + descendants
+
+    # 将属于这些文件夹的文件移到根目录（而非删除文件）
+    for fid in all_ids:
+        await db.execute(
+            update(StoredFile)
+            .where(StoredFile.folder_id == fid)
+            .values(folder_id="")
+        )
+
+    # 删除文件夹记录
+    for fid in all_ids:
+        result = await db.execute(select(Folder).where(Folder.id == fid))
+        folder_record = result.scalar_one_or_none()
+        if folder_record is not None:
+            await db.delete(folder_record)
+
+    await db.flush()
+    return all_ids
+
+
+def build_folder_response(record: Folder, all_folders: Dict[str, "Folder"]) -> Dict[str, Any]:
+    """将 Folder ORM 对象转为 API 响应字典
+
+    Args:
+        record: 文件夹 ORM 对象
+        all_folders: 所有文件夹的 {id: Folder} 字典，用于构建路径
+    """
+    # 构建路径
+    names = []
+    current_id = record.parent_id
+    seen = set()
+    while current_id:
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        parent = all_folders.get(current_id)
+        if parent is None:
+            break
+        names.append(parent.name)
+        current_id = parent.parent_id
+    names.reverse()
+    path = "/" + "/".join(names + [record.name]) if names else "/" + record.name
+    depth = len(path.strip("/").split("/"))
+
+    return {
+        "id": record.id,
+        "name": record.name,
+        "parentId": record.parent_id,
+        "encrypted": record.encrypted,
+        "allowDirectDownload": record.allow_direct_download,
+        "createdAt": format_utc_iso(record.created_at),
+        "updatedAt": format_utc_iso(record.updated_at),
+        "path": path,
+        "depth": depth,
+    }
+
+
+# ===================================================================
+# 下载令牌管理
+# ===================================================================
+
+async def create_download_token_record(
+    db: AsyncSession,
+    file_path: str,
+    folder_id: str,
+    expires_days: int,
+) -> DownloadToken:
+    """创建受保护文件的临时下载令牌"""
+    import secrets
+
+    bounded_days = max(1, min(expires_days, DOWNLOAD_TOKEN_MAX_DAYS))
+    expires_at = now_utc() + timedelta(days=bounded_days)
+    token = secrets.token_urlsafe(32)
+
+    record = DownloadToken(
+        token=token,
+        file_path=file_path,
+        folder_id=folder_id,
+        expires_at=expires_at,
+    )
+    db.add(record)
+    await db.flush()
+    return record
+
+
+async def validate_download_token(db: AsyncSession, token: str, file_path: str) -> bool:
+    """验证下载令牌（一次性使用：验证后标记为已使用，防止重复利用）"""
+    await _prune_download_tokens(db)
+    result = await db.execute(
+        select(DownloadToken).where(DownloadToken.token == token)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return False
+    # 一次性令牌：已使用过的拒绝
+    if record.used_at is not None:
+        return False
+    if record.file_path != file_path:
+        return False
+    # 标记为已使用
+    record.used_at = now_utc()
+    await db.flush()
+    return True
+
+
+async def _prune_download_tokens(db: AsyncSession) -> None:
+    """清理过期的下载令牌"""
+    await db.execute(
+        delete(DownloadToken).where(DownloadToken.expires_at <= now_utc())
+    )
+    await db.flush()
+
+
+# ===================================================================
+# 上传会话管理（断点续传）
+# ===================================================================
+
+async def create_upload_session(
+    db: AsyncSession,
+    *,
+    storage: str,
+    indexed_name: str,
+    system_name: str,
+    relative_path: str,
+    total_size: int,
+    mime_type: str,
+    folder_id: Optional[str] = None,
+) -> UploadSession:
+    """创建断点续传上传会话"""
+    import secrets
+    import uuid
+
+    upload_id = uuid.uuid4().hex
+    upload_token = secrets.token_urlsafe(32)
+    now_ts = now_utc()
+    expires_at = now_ts + timedelta(seconds=UPLOAD_SESSION_MAX_AGE_SECONDS)
+
+    record = UploadSession(
+        upload_id=upload_id,
+        upload_token=upload_token,
+        status="uploading",
+        storage=storage,
+        indexed_name=indexed_name,
+        system_name=system_name,
+        relative_path=relative_path,
+        total_size=total_size,
+        uploaded_size=0,
+        mime_type=mime_type,
+        folder_id=folder_id,
+        created_at=now_ts,
+        updated_at=now_ts,
+        expires_at=expires_at,
+    )
+    db.add(record)
+    await db.flush()
+    return record
+
+
+async def get_upload_session(db: AsyncSession, upload_id: str) -> Optional[UploadSession]:
+    """按 ID 查询上传会话"""
+    result = await db.execute(
+        select(UploadSession).where(UploadSession.upload_id == upload_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_upload_progress(
+    db: AsyncSession, upload_id: str, uploaded_size: int
+) -> Optional[UploadSession]:
+    """更新上传会话的已上传字节数"""
+    result = await db.execute(
+        select(UploadSession).where(UploadSession.upload_id == upload_id)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    record.uploaded_size = uploaded_size
+    record.updated_at = now_utc()
+    await db.flush()
+    return record
+
+
+async def complete_upload_session(db: AsyncSession, upload_id: str) -> Optional[UploadSession]:
+    """标记上传会话为已完成"""
+    result = await db.execute(
+        select(UploadSession).where(UploadSession.upload_id == upload_id)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    record.status = "completed"
+    record.updated_at = now_utc()
+    await db.flush()
+    return record
+
+
+async def cancel_upload_session(db: AsyncSession, upload_id: str) -> None:
+    """取消上传会话（删除记录 + 清理分片文件）"""
+    result = await db.execute(
+        select(UploadSession).where(UploadSession.upload_id == upload_id)
+    )
+    record = result.scalar_one_or_none()
+    if record is not None:
+        await db.delete(record)
+        await db.flush()
+    remove_chunk_file(upload_id)
+
+
+async def cleanup_expired_sessions(db: AsyncSession) -> int:
+    """清理所有过期的上传会话"""
+    result = await db.execute(
+        select(UploadSession).where(UploadSession.expires_at <= now_utc())
+    )
+    expired = result.scalars().all()
+    count = 0
+    for rec in expired:
+        remove_chunk_file(rec.upload_id)
+        await db.delete(rec)
+        count += 1
+    if count > 0:
+        await db.flush()
+    return count
+
+
+# ===================================================================
+# 审计日志
+# ===================================================================
+
+async def write_audit_log(
+    db: AsyncSession,
+    *,
+    action_type: str,
+    user: str = "",
+    app_channel: str = "",
+    indexed_name: str = "",
+    file_path: str = "",
+    client_ip: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """写入一条审计日志到数据库"""
+    record = AuditLog(
+        time=now_utc(),
+        user=user,
+        app_channel=app_channel,
+        action_type=action_type,
+        indexed_name=indexed_name,
+        file_path=file_path,
+        client_ip=client_ip,
+        extra_json=json.dumps(extra, ensure_ascii=False) if extra else None,
+    )
+    db.add(record)
+    await db.flush()
+
+
+# ===================================================================
+# 临时文件定时清理
+# ===================================================================
+
+async def cleanup_expired_temp_files(db: AsyncSession) -> int:
+    """软删除所有已过期的临时文件（expires_at <= now）"""
+    result = await db.execute(
+        select(StoredFile).where(
+            StoredFile.storage == "temporary",
+            StoredFile.expires_at.isnot(None),
+            StoredFile.expires_at <= now_utc(),
+            StoredFile.deleted_at.is_(None),
+        )
+    )
+    expired = result.scalars().all()
+    for rec in expired:
+        rec.deleted_at = now_utc()
+    if expired:
+        await db.flush()
+    return len(expired)
+
+
+async def cleanup_old_audit_logs(db: AsyncSession, retention_days: int = 90) -> int:
+    """清理超过保留期限的审计日志
+
+    Args:
+        db: 数据库会话
+        retention_days: 保留天数（默认 90 天，可通过环境变量配置）
+
+    Returns:
+        清理的日志条数
+    """
+    import os as _os
+    retain_days = int(_os.getenv("IMAGE_PROVIDER_AUDIT_LOG_RETENTION_DAYS", str(retention_days)))
+    cutoff = now_utc() - timedelta(days=retain_days)
+
+    result = await db.execute(
+        delete(AuditLog).where(AuditLog.time <= cutoff)
+    )
+    count = result.rowcount
+    if count > 0:
+        await db.flush()
+    return count
+
+
+def next_cleanup_at(reference: datetime) -> datetime:
+    """计算下一次清理的时间点"""
+    tz = reference.tzinfo or CHINA_TZ
+    target = datetime.combine(reference.date(), time(hour=CLEANUP_HOUR), tzinfo=tz)
+    if reference >= target:
+        target += timedelta(days=1)
+    return target
+
+
+async def run_cleanup_if_due(db: AsyncSession) -> None:
+    """到达清理时间时执行一次清理"""
+    current = now_local()
+    today = current.date()
+    tz = current.tzinfo or CHINA_TZ
+    cleanup_time = datetime.combine(today, time(hour=CLEANUP_HOUR), tzinfo=tz)
+    last_cleanup = read_last_cleanup_date()
+
+    if current >= cleanup_time and last_cleanup != today.isoformat():
+        await cleanup_expired_temp_files(db)
+        await cleanup_old_audit_logs(db)
+        from server_auth import clear_used_nonces_async
+        await clear_used_nonces_async(db)
+        write_last_cleanup_date(today.isoformat())
+
+
+async def cleanup_scheduler_loop(db_session_factory) -> None:
+    """清理调度循环（后台 asyncio 任务运行，每天 CLEANUP_HOUR 触发）"""
+    import asyncio
+    import logging
+    _log = logging.getLogger("imageprovider.cleanup")
+
+    try:
+        async with db_session_factory() as db:
+            await run_cleanup_if_due(db)
+    except Exception as exc:
+        _log.error(f"cleanup startup check failed: {exc}")
+
+    while not state.shutdown_event.is_set():
+        current = now_local()
+        target = next_cleanup_at(current)
+        wait_seconds = max(1, int((target - current).total_seconds()))
+        if state.shutdown_event.wait(wait_seconds):
+            break
+        try:
+            async with db_session_factory() as db:
+                cleaned = await cleanup_expired_temp_files(db)
+                audit_cleaned = await cleanup_old_audit_logs(db)
+                from server_auth import clear_used_nonces_async
+                await clear_used_nonces_async(db)
+                write_last_cleanup_date(now_local().date().isoformat())
+                if cleaned > 0 or audit_cleaned > 0:
+                    _log.info(f"cleaned up {cleaned} temp files, {audit_cleaned} audit logs")
+        except Exception as exc:
+            _log.error(f"cleanup scheduler failed: {exc}")

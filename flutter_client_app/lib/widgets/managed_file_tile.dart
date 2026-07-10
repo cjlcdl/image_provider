@@ -200,10 +200,7 @@ class ManagedFileTile extends StatelessWidget {
                           formatUploadedAt(file.uploadedAt),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: metaStyle?.copyWith(
-                            fontFamily: 'monospace',
-                            fontSize: 10,
-                          ),
+                          style: metaStyle,
                         ),
                         Text(
                           fileTypeLabel(file),

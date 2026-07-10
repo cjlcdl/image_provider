@@ -220,6 +220,88 @@ class ImageBedClient {
     return folders;
   }
 
+  /// 获取已删除文件列表（回收站）
+  Future<FileListResponse> listDeletedFiles({
+    required String publicKeyPem,
+    int page = 1,
+    int pageSize = 50,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final headers = _buildManagementHeaders(
+      publicKeyPem: publicKeyPem,
+      nonce: nonce,
+      timestamp: timestamp,
+    );
+    final queryParameters = <String, String>{
+      'page': page.toString(),
+      'pageSize': pageSize.toString(),
+      'includeDeleted': 'true',
+    };
+
+    final response = await _httpClient.get(
+      _buildUri('/api/files').replace(queryParameters: queryParameters),
+      headers: _buildRequestHeaders(headers),
+    );
+    return FileListResponse.fromApi(_decodeJsonResponse(response));
+  }
+
+  /// 恢复已删除文件
+  Future<Map<String, dynamic>> restoreFiles({
+    required String publicKeyPem,
+    required List<String> fileIds,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final request = http.Request('POST', _buildUri('/api/files/restore'));
+    request.headers.addAll(_buildRequestHeaders(
+      _buildManagementHeaders(
+        publicKeyPem: publicKeyPem,
+        nonce: nonce,
+        timestamp: timestamp,
+      ),
+    ));
+    request.headers['Content-Type'] = 'application/json; charset=utf-8';
+    request.bodyBytes = utf8.encode(jsonEncode(<String, dynamic>{
+      'fileIds': fileIds,
+    }));
+
+    final response = await http.Response.fromStream(await _httpClient.send(request));
+    return _decodeJsonResponse(response);
+  }
+
+  /// 永久删除文件
+  Future<Map<String, dynamic>> permanentDeleteFiles({
+    required String publicKeyPem,
+    required List<String> fileIds,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final queryParameters = <String, String>{
+      'permanent': 'true',
+    };
+    final headers = _buildRequestHeaders(
+      _buildManagementHeaders(
+        publicKeyPem: publicKeyPem,
+        nonce: nonce,
+        timestamp: timestamp,
+      ),
+    );
+
+    final request = http.Request(
+      'DELETE',
+      _buildUri('/api/files').replace(queryParameters: queryParameters),
+    );
+    request.headers.addAll(headers);
+    request.headers['Content-Type'] = 'application/json; charset=utf-8';
+    request.bodyBytes = utf8.encode(jsonEncode(<String, dynamic>{
+      'fileIds': fileIds,
+    }));
+
+    final response = await http.Response.fromStream(await _httpClient.send(request));
+    return _decodeJsonResponse(response);
+  }
+
   Future<Map<String, dynamic>> createFolder({
     required String publicKeyPem,
     required String name,
@@ -861,7 +943,7 @@ class ImageBedClient {
   }) {
     final publicKey = _parsePublicKeyFromPem(publicKeyPem);
     final plaintext = jsonEncode(payload);
-    final encryptedBytes = _rsaEncryptPkcs1(
+    final encryptedBytes = _rsaEncryptOaep(
       plainBytes: Uint8List.fromList(utf8.encode(plaintext)),
       publicKey: publicKey,
     );
@@ -1765,11 +1847,12 @@ class ImageBedClient {
     return RSAPublicKey(modulus, exponent);
   }
 
-  Uint8List _rsaEncryptPkcs1({
+  /// RSA-OAEP SHA-256 加密（v3.1 升级：从 PKCS#1 v1.5 迁移至 OAEP）
+  Uint8List _rsaEncryptOaep({
     required Uint8List plainBytes,
     required RSAPublicKey publicKey,
   }) {
-    final cipher = PKCS1Encoding(RSAEngine())
+    final cipher = OAEPEncoding.withSHA256(RSAEngine())
       ..init(true, PublicKeyParameter<RSAPublicKey>(publicKey));
     final output = <int>[];
     final inputBlockSize = cipher.inputBlockSize;

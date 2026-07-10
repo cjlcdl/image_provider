@@ -6,6 +6,7 @@ import 'package:courage_storage/controllers/file_manager_controller.dart';
 import 'package:courage_storage/models/base_url_preset.dart';
 import 'package:courage_storage/models/indexed_folder.dart';
 import 'package:courage_storage/models/managed_file.dart';
+import 'package:courage_storage/pages/trash_page.dart';
 import 'package:courage_storage/services/image_bed_client.dart';
 import 'package:courage_storage/services/shared_file_handler.dart';
 import 'package:courage_storage/services/notification_service.dart';
@@ -2803,6 +2804,29 @@ class _FileManagerPageState extends State<FileManagerPage> {
                   ],
                 ),
               ),
+              const SizedBox(height: 16),
+              PanelCard(
+                title: '回收站',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('管理已删除的文件，可恢复或永久删除。',
+                        style: TextStyle(fontSize: 13)),
+                    const SizedBox(height: 12),
+                    FilledButton.tonalIcon(
+                      onPressed: () {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => TrashPage(baseUrl: _controller.baseUrl),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('打开回收站'),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
         ),
@@ -2924,6 +2948,27 @@ class _FileManagerPageState extends State<FileManagerPage> {
                     icon: const Icon(Icons.refresh_rounded),
                   ),
                 ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        PanelCard(
+          title: '回收站',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const Text('管理已删除的文件，可恢复或永久删除。',
+                  style: TextStyle(fontSize: 13)),
+              const SizedBox(height: 12),
+              FilledButton.tonalIcon(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => TrashPage(baseUrl: _controller.baseUrl)),
+                  );
+                },
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('打开回收站'),
               ),
             ],
           ),
