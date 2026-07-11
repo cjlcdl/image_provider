@@ -85,7 +85,7 @@ class DetailTable extends StatefulWidget {
 class _DetailTableState extends State<DetailTable> {
   static const double _checkboxWidth = 48;
   static const double _rowHeight = 44;
-  static const double _minColumnWidth = 60;
+  static const double _minColumnWidth = 48;
   static const double _dividerWidth = 6;
 
   IndexedFolder? _hoveredFolder;
@@ -275,7 +275,7 @@ class _DetailTableState extends State<DetailTable> {
         height: _rowHeight,
         decoration: BoxDecoration(
           color: isSelected
-              ? theme.colorScheme.primaryContainer.withValues(alpha: 0.3)
+              ? theme.colorScheme.primaryContainer.withValues(alpha: 0.5)
               : (isFolder && _hoveredFolder?.id == row.folder?.id)
               ? theme.colorScheme.primaryContainer.withValues(alpha: 0.15)
               : Colors.transparent,
@@ -333,7 +333,7 @@ class _DetailTableState extends State<DetailTable> {
                 ),
               ] else ...[
                 _buildCell(
-                  Text('文件夹', style: theme.textTheme.bodySmall),
+                  Text('目录', style: theme.textTheme.bodySmall),
                   _widthFor(DetailColumn.type),
                 ),
                 _buildCell(
@@ -342,14 +342,12 @@ class _DetailTableState extends State<DetailTable> {
                 ),
               ],
               _buildCell(
-                Text(
-                  isFile
-                      ? ManagedFileTile.formatUploadedAt(row.file!.uploadedAt)
-                      : '',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall,
-                ),
+                isFile
+                    ? _UploadedAtText(
+                        uploadedAt: row.file!.uploadedAt,
+                        style: theme.textTheme.bodySmall,
+                      )
+                    : const SizedBox.shrink(),
                 _widthFor(DetailColumn.uploadedAt),
               ),
             ],
@@ -502,6 +500,67 @@ class _DetailRow {
   final IndexedFolder? folder;
 }
 
+/// 上传时间文本 — 列宽不足时将日期和时间拆为两行。
+class _UploadedAtText extends StatelessWidget {
+  const _UploadedAtText({required this.uploadedAt, this.style});
+
+  final String? uploadedAt;
+  final TextStyle? style;
+
+  static const double _splitThreshold = 100;
+
+  @override
+  Widget build(BuildContext context) {
+    final formatted = ManagedFileTile.formatUploadedAt(uploadedAt);
+    if (formatted == '上传时间未知' || !formatted.contains(' ')) {
+      return Text(
+        formatted,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: style,
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth >= _splitThreshold) {
+          return Text(
+            formatted,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: style,
+          );
+        }
+        final parts = formatted.split(' ');
+        final date = parts.first;
+        final time = parts.length > 1 ? parts.sublist(1).join(' ') : '';
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: <Widget>[
+            Text(
+              date,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: style?.copyWith(
+                fontSize: (style?.fontSize ?? 12) * 0.85,
+              ),
+            ),
+            Text(
+              time,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: style?.copyWith(
+                fontSize: (style?.fontSize ?? 12) * 0.85,
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 /// 列间分隔条 — 拖动调整右侧列宽。光标绝对位置为判定基准。
 class _ColumnDivider extends StatefulWidget {
   const _ColumnDivider({
@@ -522,19 +581,22 @@ class _ColumnDivider extends StatefulWidget {
 }
 
 class _ColumnDividerState extends State<_ColumnDivider> {
-  static const double _minWidth = 60;
+  static const double _minWidth = 48;
   static const double _maxWidth = 300;
 
   double _startWidth = 0;
   double _startX = 0;
+  bool _dragging = false;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onHorizontalDragStart: (details) {
         _startWidth = widget.colWidth;
         _startX = details.globalPosition.dx;
+        setState(() => _dragging = true);
       },
       onHorizontalDragUpdate: (details) {
         final w = (_startWidth - (details.globalPosition.dx - _startX))
@@ -543,13 +605,23 @@ class _ColumnDividerState extends State<_ColumnDivider> {
         widget.onWidthUpdate(w);
       },
       onHorizontalDragEnd: (_) {
+        setState(() => _dragging = false);
         widget.onWidthCommit(widget.colWidth);
+      },
+      onHorizontalDragCancel: () {
+        setState(() => _dragging = false);
       },
       child: MouseRegion(
         cursor: SystemMouseCursors.resizeColumn,
         child: Container(
           width: _DetailTableState._dividerWidth,
-          color: Colors.transparent,
+          alignment: Alignment.center,
+          child: Container(
+            width: _dragging ? 2.0 : 1.0,
+            color: _dragging
+                ? theme.colorScheme.primary
+                : theme.dividerColor.withValues(alpha: 0.4),
+          ),
         ),
       ),
     );

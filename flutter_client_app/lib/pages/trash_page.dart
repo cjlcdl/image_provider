@@ -72,12 +72,14 @@ class _TrashPageState extends State<TrashPage> {
       if (!mounted) return;
       _selectedFileIds.clear();
       await _loadDeletedFiles();
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('已恢复')),
       );
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('恢复失败: $e')),
       );
@@ -114,12 +116,14 @@ class _TrashPageState extends State<TrashPage> {
       if (!mounted) return;
       _selectedFileIds.clear();
       await _loadDeletedFiles();
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('已永久删除')),
       );
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('删除失败: $e')),
       );

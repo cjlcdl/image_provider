@@ -112,7 +112,7 @@ class ManagedFileTile extends StatelessWidget {
     if (dotIndex > 0 && dotIndex < fileName.length - 1) {
       final ext = fileName.substring(dotIndex + 1);
       // 特殊处理常见压缩格式
-      return "${ext.toUpperCase()}文件";
+      return ext.toUpperCase();
     }
     final mimeType = file.mimeType.toLowerCase();
     if (mimeType.startsWith('image/')) return '图片文件';
@@ -135,7 +135,7 @@ class ManagedFileTile extends StatelessWidget {
     );
 
     return Material(
-      color: selected ? const Color(0xFFF3F3F3) : Colors.white,
+      color: selected ? const Color(0xFFD3E3FD) : Colors.white,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
@@ -217,30 +217,12 @@ class ManagedFileTile extends StatelessWidget {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: <Widget>[
-                  selected ? 
-                      Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF3A3A3A),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: const Text(
-                            '已选择',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          )) : 
-                      Text(
-                        formatSize(file.size),
-                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          fontSize: 11,
-                        ),
-                      )
+                  Text(
+                    formatSize(file.size),
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      fontSize: 11,
+                    ),
+                  )
                 ],
               ),
             ],
