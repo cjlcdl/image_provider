@@ -84,9 +84,9 @@ class _FileManagerPageState extends State<FileManagerPage> {
           : '$path  ·  加密';
     }
     if (vis == 'private') {
-      return '$path  ·  私密';
+      return '$path  ·  非公开';
     }
-    return path;
+    return '$path  ·  公开';
   }
 
   List<_BrowserEntry> get _browserEntries {
