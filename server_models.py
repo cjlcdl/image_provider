@@ -177,7 +177,7 @@ class Folder(Base):
     """虚拟文件夹表
 
     支持多级嵌套（通过 parent_id 自引用）、密码加密保护。
-    替代原 folder_index.py 中的 JSON 文件持久化方案。
+    visibility: public=公开下载 / private=需Courage-Token / encrypted=Token+密码
     """
 
     __tablename__ = "folders"
@@ -188,13 +188,15 @@ class Folder(Base):
     name = Column(String(120), nullable=False)
     # 父文件夹 ID（NULL 表示根级文件夹）
     parent_id = Column(String(36), nullable=True)
-    # 是否加密
+    # 可见性：public / private / encrypted（新增，优先于 encrypted 字段）
+    visibility = Column(String(16), nullable=False, default="public")
+    # 是否加密（兼容旧逻辑，visibility=encrypted 时生效）
     encrypted = Column(Boolean, nullable=False, default=False)
     # PBKDF2 密码盐值（Base64 编码，仅加密文件夹使用）
     password_salt = Column(String(32), nullable=True)
     # PBKDF2 密码哈希（Base64 编码，仅加密文件夹使用）
     password_hash = Column(String(128), nullable=True)
-    # 是否允许直接下载（无需下载令牌）
+    # 是否允许直接下载（兼容旧逻辑）
     allow_direct_download = Column(Boolean, nullable=False, default=True)
     # 创建时间
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -234,6 +236,44 @@ class DownloadToken(Base):
 
     __table_args__ = (
         Index("idx_download_tokens_expires", "expires_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 分享链接表 — share_links
+# ---------------------------------------------------------------------------
+
+class ShareLink(Base):
+    """分享链接表
+
+    为 private/encrypted 文件夹或文件创建有时效的公开下载链接。
+    """
+
+    __tablename__ = "share_links"
+
+    id = Column(String(36), primary_key=True)
+    # URL 安全随机令牌（用于 /s/{token} 公开访问）
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    # 资源类型：file / folder
+    resource_type = Column(String(8), nullable=False)
+    # 文件路径（resource_type=file 时）
+    file_path = Column(String(512), nullable=True)
+    # 文件夹 ID（resource_type=folder 时）
+    folder_id = Column(String(36), nullable=True)
+    # 创建者标识
+    created_by = Column(String(128), nullable=True)
+    # 过期时间
+    expires_at = Column(DateTime, nullable=False)
+    # 撤销时间（NULL=有效）
+    revoked_at = Column(DateTime, nullable=True)
+    # 创建时间
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # 访问次数
+    access_count = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("idx_share_links_token", "token"),
+        Index("idx_share_links_expires", "expires_at"),
     )
 
 

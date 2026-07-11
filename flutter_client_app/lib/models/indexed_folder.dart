@@ -5,6 +5,8 @@ class IndexedFolder {
     required this.parentId,
     required this.encrypted,
     required this.allowDirectDownload,
+    required this.visibility,
+    required this.effectiveVisibility,
     required this.path,
     required this.depth,
     required this.createdAt,
@@ -16,6 +18,8 @@ class IndexedFolder {
   final String? parentId;
   final bool encrypted;
   final bool allowDirectDownload;
+  final String visibility;
+  final String effectiveVisibility;
   final String path;
   final int depth;
   final String? createdAt;
@@ -30,6 +34,8 @@ class IndexedFolder {
       parentId: json['parentId']?.toString(),
       encrypted: json['encrypted'] == true,
       allowDirectDownload: json['allowDirectDownload'] == true,
+      visibility: (json['visibility'] ?? 'public').toString(),
+      effectiveVisibility: (json['effectiveVisibility'] ?? 'public').toString(),
       path: (json['path'] ?? '/').toString(),
       depth: (json['depth'] as num?)?.toInt() ?? 0,
       createdAt: json['createdAt']?.toString(),

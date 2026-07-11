@@ -36,6 +36,7 @@ class DetailTable extends StatefulWidget {
     this.sortDirection,
     required this.columnWidths,
     required this.onFileTap,
+    required this.onFolderTap,
     required this.onFileDoubleTap,
     required this.onFolderDoubleTap,
     this.onFileContextMenu,
@@ -47,6 +48,7 @@ class DetailTable extends StatefulWidget {
     this.onDragToFolder,
     this.onFolderHover,
     this.onFolderUnhover,
+    this.onFolderAcceptDrop,
     this.isDesktop = false,
     this.folderIcon,
   });
@@ -60,6 +62,7 @@ class DetailTable extends StatefulWidget {
   final SortDirection? sortDirection;
   final Map<DetailColumn, double> columnWidths;
   final void Function(ManagedFile file, bool isCtrlHeld) onFileTap;
+  final void Function(IndexedFolder folder, bool isCtrlHeld) onFolderTap;
   final void Function(ManagedFile) onFileDoubleTap;
   final void Function(IndexedFolder) onFolderDoubleTap;
   final void Function(ManagedFile, Offset)? onFileContextMenu;
@@ -71,6 +74,7 @@ class DetailTable extends StatefulWidget {
   final void Function(IndexedFolder)? onDragToFolder;
   final void Function(IndexedFolder)? onFolderHover;
   final VoidCallback? onFolderUnhover;
+  final void Function(IndexedFolder folder, List<ManagedFile> files)? onFolderAcceptDrop;
   final bool isDesktop;
   final IconData Function(IndexedFolder)? folderIcon;
 
@@ -272,7 +276,7 @@ class _DetailTableState extends State<DetailTable> {
         decoration: BoxDecoration(
           color: isSelected
               ? theme.colorScheme.primaryContainer.withValues(alpha: 0.3)
-              : _hoveredFolder?.id == row.folder?.id
+              : (isFolder && _hoveredFolder?.id == row.folder?.id)
               ? theme.colorScheme.primaryContainer.withValues(alpha: 0.15)
               : Colors.transparent,
           border: Border(
@@ -372,7 +376,7 @@ class _DetailTableState extends State<DetailTable> {
       );
     }
 
-    return InkWell(
+    Widget result = InkWell(
       onTap: () {
         final ctrl = HardwareKeyboard.instance.logicalKeysPressed
             .intersection(<LogicalKeyboardKey>{
@@ -383,10 +387,7 @@ class _DetailTableState extends State<DetailTable> {
         if (isFile) {
           widget.onFileTap(row.file!, ctrl);
         } else if (isFolder) {
-          widget.onToggleFolderSelection(
-            row.folder!,
-            !widget.selectedFolderIds.contains(row.folder!.id),
-          );
+          widget.onFolderTap(row.folder!, ctrl);
         }
       },
       onDoubleTap: () {
@@ -398,6 +399,57 @@ class _DetailTableState extends State<DetailTable> {
       },
       child: rowWidget,
     );
+
+    // 桌面端：文件行支持长按拖拽到文件夹
+    if (widget.isDesktop && isFile) {
+      final file = row.file!;
+      final isFileSelected = widget.selectedFilePaths.contains(file.path);
+      result = LongPressDraggable<List<ManagedFile>>(
+        data: isFileSelected && widget.selectedFilePaths.isNotEmpty
+            ? widget.files
+                .where((f) => widget.selectedFilePaths.contains(f.path))
+                .toList(growable: false)
+            : <ManagedFile>[file],
+        delay: const Duration(milliseconds: 400),
+        feedback: Material(
+          elevation: 4,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.drive_file_move_outline, size: 18),
+                const SizedBox(width: 6),
+                Text(
+                  isFileSelected && widget.selectedFilePaths.length > 1
+                      ? '移动 ${widget.selectedFilePaths.length} 项'
+                      : '移动文件',
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ),
+        child: result,
+      );
+    }
+
+    // 桌面端：文件夹行接收拖拽的文件
+    if (widget.isDesktop && isFolder) {
+      final child = result;
+      result = DragTarget<List<ManagedFile>>(
+        onWillAcceptWithDetails: (_) => true,
+        onAcceptWithDetails: (details) {
+          widget.onFolderAcceptDrop?.call(row.folder!, details.data);
+        },
+        builder: (context, candidateData, rejectedData) {
+          return child;
+        },
+      );
+    }
+
+    return result;
   }
 
   Widget _nameContent(_DetailRow row, ThemeData theme) {

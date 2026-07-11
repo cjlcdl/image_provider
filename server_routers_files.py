@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from config import PERMANENT_TOKEN_HEADER
-from server_auth import verify_management_token
+from server_auth import check_folder_password_token, verify_management_token
 from server_database import get_db
 from server_storage import (
     build_file_response,
@@ -45,6 +45,7 @@ from server_utils import (
     build_cas_path,
     build_content_disposition,
     extract_extension,
+    format_utc_iso,
     get_file_url,
     is_inline_mime_type,
     normalize_folder_id,
@@ -121,7 +122,14 @@ async def handle_list_files(
     )
 
     total_pages = (total + pageSize - 1) // pageSize if total else 0
-    file_responses = [build_file_response(f) for f in files]
+    from server_storage import get_folder_visibility_chain
+    vis_cache: dict = {}
+    file_responses = []
+    for f in files:
+        fid = f.folder_id or ""
+        if fid not in vis_cache:
+            vis_cache[fid] = await get_folder_visibility_chain(db, fid) or "public"
+        file_responses.append(build_file_response(f, effective_visibility=vis_cache[fid]))
 
     return JSONResponse(
         status_code=200,
@@ -187,18 +195,27 @@ async def serve_file(
             raise HTTPException(status_code=410, detail="file expired")
         raise HTTPException(status_code=404, detail="file not found")
 
-    # 检查文件夹下载权限
+    # 检查文件夹下载权限（基于 visibility）
     if record.folder_id:
-        from server_models import Folder
-        from sqlalchemy import select
-        result = await db.execute(select(Folder).where(Folder.id == record.folder_id))
-        folder_record = result.scalar_one_or_none()
-        if folder_record and folder_record.encrypted and not folder_record.allow_direct_download:
-            if not downloadToken:
-                raise HTTPException(status_code=401, detail="invalid download token")
-            from server_storage import validate_download_token
-            if not await validate_download_token(db, downloadToken.strip(), full_path):
-                raise HTTPException(status_code=401, detail="invalid download token")
+        from server_storage import get_folder_visibility_chain
+        vis = await get_folder_visibility_chain(db, record.folder_id)
+        if vis is None:
+            raise HTTPException(status_code=404, detail="folder not found")
+
+        if vis == "private":
+            # 需要 Courage-Token
+            courage_header = request.headers.get(PERMANENT_TOKEN_HEADER, "")
+            if not courage_header.strip():
+                raise HTTPException(status_code=401, detail="authentication required")
+            await verify_management_token(db, courage_header)
+        elif vis == "encrypted":
+            # 需要 Courage-Token + downloadToken（加密文件夹密码验证）
+            if downloadToken:
+                from server_storage import validate_download_token
+                if not await validate_download_token(db, downloadToken.strip(), full_path):
+                    raise HTTPException(status_code=401, detail="invalid download token")
+            else:
+                raise HTTPException(status_code=401, detail="download token required for encrypted folder")
 
     # 记录访问
     await record_file_access(db, record.file_id)
@@ -718,3 +735,251 @@ async def handle_assign_files_to_folder(
             "data": {"updated": updated, "missing": missing},
         },
     )
+
+
+# ===================================================================
+# GET /s/{token} — 分享链接公开下载
+# ===================================================================
+
+@router.api_route("/s/{token:path}", methods=["GET", "HEAD"])
+async def serve_shared_file(
+    request: Request,
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """通过分享链接访问受保护的文件/文件夹"""
+    from server_storage import (
+        get_share_link_by_token, record_share_link_access,
+        list_files_query, get_folder_record, collect_descendant_folder_ids,
+    )
+
+    link = await get_share_link_by_token(db, token)
+    if link is None:
+        raise HTTPException(status_code=404, detail="share link not found or expired")
+
+    await record_share_link_access(db, token)
+
+    if link.resource_type == "file":
+        from server_storage import get_file_by_url
+        record = await get_file_by_url(db, link.file_path)
+        if record is None:
+            raise HTTPException(status_code=404, detail="file not found")
+        target_path, _ = build_cas_path(record.sha256, record.extension)
+        if not target_path.exists():
+            raise HTTPException(status_code=404, detail="file not found")
+
+        mime_type = record.mime_type
+        disposition_mode = "inline" if is_inline_mime_type(mime_type) else "attachment"
+        download_name = sanitize_index_name(record.indexed_name) or record.system_name
+        cd = build_content_disposition(disposition_mode, download_name)
+        fsize = target_path.stat().st_size
+
+        if request.method == "HEAD":
+            from fastapi.responses import Response
+            return Response(status_code=200, headers={
+                "Content-Type": mime_type, "Content-Length": str(fsize),
+                "Content-Disposition": cd, "Accept-Ranges": "bytes",
+                "X-Content-Type-Options": "nosniff",
+            })
+
+        return StreamingResponse(
+            _async_file_chunk_generator(target_path),
+            status_code=200, media_type=mime_type,
+            headers={"Content-Disposition": cd, "Accept-Ranges": "bytes",
+                     "X-Content-Type-Options": "nosniff", "Content-Length": str(fsize)},
+        )
+
+    # 文件夹分享：打包 ZIP
+    import tempfile, zipfile, os as _os
+
+    folder_record = await get_folder_record(db, link.folder_id)
+    if folder_record is None:
+        raise HTTPException(status_code=404, detail="folder not found")
+
+    descendant_ids = await collect_descendant_folder_ids(db, link.folder_id)
+    related_ids = [link.folder_id] + descendant_ids
+    all_files = []
+    for fid in related_ids:
+        files, _ = await list_files_query(db, folder_id=fid, page_size=10000)
+        for f in files:
+            all_files.append(f)
+
+    archive_name = f"{sanitize_index_name(folder_record.name) or 'archive'}.zip"
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".zip")
+    _os.close(temp_fd)
+
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for file_record in all_files:
+                tp, _ = build_cas_path(file_record.sha256, file_record.extension)
+                if not tp.exists():
+                    continue
+                fn = sanitize_index_name(file_record.indexed_name) or file_record.system_name
+                zf.write(str(tp), fn)
+
+        cd = build_content_disposition("attachment", archive_name)
+
+        def zip_gen():
+            cs = 64 * 1024
+            with open(temp_path, "rb") as f:
+                while chunk := f.read(cs):
+                    yield chunk
+            try:
+                _os.unlink(temp_path)
+            except OSError:
+                pass
+
+        return StreamingResponse(
+            zip_gen(), media_type="application/zip",
+            headers={"Content-Disposition": cd, "X-Content-Type-Options": "nosniff"},
+        )
+    except Exception:
+        try:
+            _os.unlink(temp_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="failed to create archive")
+
+
+# ===================================================================
+# POST /api/share-links — 创建分享链接
+# ===================================================================
+
+@router.post("/api/share-links")
+async def handle_create_share_link(
+    request: Request,
+    courage_token: str = Header("", alias=PERMANENT_TOKEN_HEADER),
+    folder_password_token: str = Header("", alias=FOLDER_PASSWORD_TOKEN_HEADER),
+    db: AsyncSession = Depends(get_db),
+):
+    """为文件或文件夹创建公开分享链接
+    请求体：{"resourceType":"file|folder","filePath":"/p/xxx" 或 "folderId":"xxx","expiresInDays":7}
+    """
+    await verify_management_token(db, courage_token)
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid json body")
+
+    resource_type = body.get("resourceType")
+    if resource_type not in ("file", "folder"):
+        raise HTTPException(status_code=400, detail="invalid resource type")
+
+    expires_days_raw = body.get("expiresInDays")
+    if isinstance(expires_days_raw, str) and expires_days_raw.isdigit():
+        expires_days_raw = int(expires_days_raw)
+    expires_days = expires_days_raw if isinstance(expires_days_raw, int) else 7
+    if not (1 <= expires_days <= 365):
+        raise HTTPException(status_code=400, detail="expiresInDays must be 1-365")
+
+    from server_storage import create_share_link, list_share_links_for_resource
+
+    if resource_type == "file":
+        file_path = body.get("filePath")
+        if not isinstance(file_path, str) or not file_path:
+            raise HTTPException(status_code=400, detail="missing file path")
+        from server_storage import get_file_by_url
+        record = await get_file_by_url(db, file_path)
+        if record is None:
+            raise HTTPException(status_code=404, detail="file not found")
+
+        link = await create_share_link(
+            db=db, resource_type="file", file_path=file_path,
+            created_by=request.headers.get("USER", ""), expires_days=expires_days,
+        )
+        existing = await list_share_links_for_resource(db, resource_type="file", file_path=file_path)
+    else:
+        folder_id = normalize_folder_id(body.get("folderId"))
+        if not folder_id:
+            raise HTTPException(status_code=400, detail="missing folder id")
+        from server_storage import get_folder_record
+        folder_record = await get_folder_record(db, folder_id)
+        if folder_record is None:
+            raise HTTPException(status_code=404, detail="folder not found")
+        if folder_record.encrypted or folder_record.visibility == "encrypted":
+            await check_folder_password_token(db, folder_id, folder_password_token)
+
+        link = await create_share_link(
+            db=db, resource_type="folder", folder_id=folder_id,
+            created_by=request.headers.get("USER", ""), expires_days=expires_days,
+        )
+        existing = await list_share_links_for_resource(db, resource_type="folder", folder_id=folder_id)
+
+    await write_audit_log(
+        db=db, action_type="create_share_link",
+        file_path=file_path if resource_type == "file" else folder_id,
+        client_ip=request.client.host if request.client else "",
+        extra={"resourceType": resource_type, "expiresInDays": expires_days},
+    )
+
+    return JSONResponse(status_code=200, content={
+        "code": 0, "message": "share link created",
+        "data": {
+            "id": link.id, "token": link.token, "url": f"/s/{link.token}",
+            "expiresAt": format_utc_iso(link.expires_at),
+            "expiresInDays": expires_days,
+            "existingLinks": [
+                {"id": l.id, "token": l.token, "url": f"/s/{l.token}",
+                 "expiresAt": format_utc_iso(l.expires_at),
+                 "accessCount": l.access_count or 0,
+                 "createdAt": format_utc_iso(l.created_at)}
+                for l in existing
+            ],
+        },
+    })
+
+
+# ===================================================================
+# GET /api/share-links — 列出分享链接
+# ===================================================================
+
+@router.get("/api/share-links")
+async def handle_list_share_links(
+    request: Request,
+    resourceType: Optional[str] = Query("file"),
+    filePath: Optional[str] = Query(None),
+    folderId: Optional[str] = Query(None),
+    courage_token: str = Header("", alias=PERMANENT_TOKEN_HEADER),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出某资源的有效分享链接"""
+    await verify_management_token(db, courage_token)
+
+    from server_storage import list_share_links_for_resource
+    links = await list_share_links_for_resource(
+        db,
+        resource_type=resourceType or "file",
+        file_path=filePath,
+        folder_id=normalize_folder_id(folderId) if folderId else None,
+    )
+
+    return JSONResponse(status_code=200, content={
+        "code": 0, "message": "ok",
+        "data": {"links": [
+            {"id": l.id, "token": l.token, "url": f"/s/{l.token}",
+             "resourceType": l.resource_type, "filePath": l.file_path,
+             "folderId": l.folder_id,
+             "expiresAt": format_utc_iso(l.expires_at),
+             "accessCount": l.access_count or 0,
+             "createdAt": format_utc_iso(l.created_at)}
+            for l in links
+        ]},
+    })
+
+
+# ===================================================================
+# DELETE /api/share-links/{id} — 撤销分享链接
+# ===================================================================
+
+@router.delete("/api/share-links/{link_id}")
+async def handle_revoke_share_link(
+    link_id: str,
+    courage_token: str = Header("", alias=PERMANENT_TOKEN_HEADER),
+    db: AsyncSession = Depends(get_db),
+):
+    """撤销分享链接"""
+    await verify_management_token(db, courage_token)
+    from server_storage import revoke_share_link
+    if not await revoke_share_link(db, link_id):
+        raise HTTPException(status_code=404, detail="share link not found")
+    return JSONResponse(status_code=200, content={"code": 0, "message": "share link revoked"})

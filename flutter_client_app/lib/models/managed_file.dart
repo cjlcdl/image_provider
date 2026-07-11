@@ -19,6 +19,7 @@ class ManagedFile {
     this.lastAccessedAt,
     this.deletedAt,
     this.isDeleted = false,
+    this.effectiveVisibility = 'public',
   });
 
   /// 12位短字符串文件ID（主标识）
@@ -69,6 +70,9 @@ class ManagedFile {
   /// 是否已删除
   final bool isDeleted;
 
+  /// 有效可见性（由父文件夹链中最严格的级别决定）
+  final String effectiveVisibility;
+
   /// 是否为临时文件
   bool get isTemporary => storage == 'temporary';
 
@@ -97,6 +101,7 @@ class ManagedFile {
       lastAccessedAt: json['lastAccessedAt']?.toString(),
       deletedAt: json['deletedAt']?.toString(),
       isDeleted: json['isDeleted'] == true,
+      effectiveVisibility: (json['effectiveVisibility'] ?? 'public').toString(),
     );
   }
 

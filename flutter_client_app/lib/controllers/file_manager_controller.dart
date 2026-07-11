@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:pdfx/pdfx.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:courage_storage/models/base_url_preset.dart';
@@ -111,6 +112,35 @@ class FileManagerController extends ChangeNotifier {
       'selected_base_url_preset_id';
   static const String _defaultBaseUrlPresetId = '__default_base_url__';
   static const String _columnWidthsPreferenceKey = 'detail_column_widths';
+  static const String _previewThresholdPreferenceKey = 'preview_threshold_level';
+  static const int _defaultPreviewThresholdLevel = 12; // 2 MB
+
+  /// 指数级预览阈值（字节），索引 0=总是加载，21=无上限
+  static const List<int> _previewThresholdLevels = <int>[
+    0,           // 不加载
+    1024,        // 1 KB
+    2048,        // 2 KB
+    4096,        // 4 KB
+    8192,        // 8 KB
+    16384,       // 16 KB
+    32768,       // 32 KB
+    65536,       // 64 KB
+    131072,      // 128 KB
+    262144,      // 256 KB
+    524288,      // 512 KB
+    1048576,     // 1 MB
+    2097152,     // 2 MB
+    4194304,     // 4 MB
+    8388608,     // 8 MB
+    16777216,    // 16 MB
+    33554432,    // 32 MB
+    67108864,    // 64 MB
+    134217728,   // 128 MB
+    268435456,   // 256 MB
+    536870912,   // 512 MB
+    9223372036854775807, // 总是加载
+  ];
+  static const int _previewThresholdMaxLevel = 21;
 
   FileManagerController({
     required String initialBaseUrl,
@@ -159,11 +189,14 @@ class FileManagerController extends ChangeNotifier {
   bool _showingCachedFolderContent = false;
   ManagedFile? _previewFile;
   Uint8List? _previewImageBytes;
+  List<Uint8List>? _previewPdfPages;
+  String? _previewTextContent;
   String? _previewError;
   int _previewTransferredBytes = 0;
   int? _previewTotalBytes;
   String? _lastActionError;
   bool _lastActionWasBusy = false;
+  int _previewThresholdLevel = _defaultPreviewThresholdLevel;
   String? _sortColumnName;
   bool _sortAscending = true;
   final Map<String, double> _columnWidths =
@@ -188,6 +221,9 @@ class FileManagerController extends ChangeNotifier {
   int get diskFreeBytes => _diskFreeBytes;
   String get diskTotalSizeLabel => _formatBytes(_diskTotalBytes);
   String get diskFreeSizeLabel => _formatBytes(_diskFreeBytes);
+  int get previewThresholdLevel => _previewThresholdLevel;
+  int get previewThresholdBytes =>
+      _previewThresholdLevels[_previewThresholdLevel.clamp(0, _previewThresholdMaxLevel)];
   String get downloadDirectory => _downloadDirectory;
   bool get hasDownloadDirectory => _downloadDirectory.trim().isNotEmpty;
   List<ManagedFile> get files => List<ManagedFile>.unmodifiable(_files);
@@ -269,6 +305,8 @@ class FileManagerController extends ChangeNotifier {
   bool get showingCachedFolderContent => _showingCachedFolderContent;
   ManagedFile? get previewFile => _previewFile;
   Uint8List? get previewImageBytes => _previewImageBytes;
+  List<Uint8List>? get previewPdfPages => _previewPdfPages;
+  String? get previewTextContent => _previewTextContent;
   String? get previewError => _previewError;
   int get previewTransferredBytes => _previewTransferredBytes;
   int? get previewTotalBytes => _previewTotalBytes;
@@ -426,7 +464,7 @@ class FileManagerController extends ChangeNotifier {
   void clearSelection() {
     _selectedPaths.clear();
     _selectedFolderIds.clear();
-    notifyListeners();
+   notifyListeners();
   }
 
   void setCurrentFolder(String? folderId) {
@@ -518,6 +556,8 @@ class FileManagerController extends ChangeNotifier {
   void clearPreview() {
     _previewFile = null;
     _previewImageBytes = null;
+    _previewPdfPages = null;
+    _previewTextContent = null;
     _previewError = null;
     _previewLoading = false;
     _previewTransferredBytes = 0;
@@ -540,6 +580,11 @@ class FileManagerController extends ChangeNotifier {
       _applyBaseUrlPreset(preferredPreset, notify: false, appendLog: false);
     }
     _loadColumnWidths(preferences);
+    final savedLevel =
+        preferences.getInt(_previewThresholdPreferenceKey);
+    if (savedLevel != null && savedLevel >= 0 && savedLevel <= _previewThresholdMaxLevel) {
+      _previewThresholdLevel = savedLevel;
+    }
     notifyListeners();
   }
 
@@ -1280,15 +1325,43 @@ class FileManagerController extends ChangeNotifier {
     _previewFile = file;
     _previewError = null;
     _previewImageBytes = null;
+    _previewPdfPages = null;
+    _previewTextContent = null;
     _previewTransferredBytes = 0;
     _previewTotalBytes = null;
 
-    if (!file.mimeType.startsWith('image/')) {
-      _previewLoading = false;
+    // 文本文件（含 PDF / 二进制 Office）→ 加载为字符串
+    if (_isPreviewableTextFile(file)) {
+      _previewLoading = true;
       notifyListeners();
+      try {
+        final bytes = await _client.downloadBytesWithProgress(
+          file.path,
+          onProgress: (transferredBytes, totalBytes) {
+            if (_previewFile?.path != file.path) return;
+            _previewTransferredBytes = transferredBytes;
+            _previewTotalBytes = totalBytes;
+            notifyListeners();
+          },
+        );
+        if (_previewFile?.path != file.path) return;
+        _previewTextContent = utf8.decode(bytes, allowMalformed: true);
+        _previewTransferredBytes = bytes.length;
+        _previewTotalBytes ??= bytes.length;
+      } catch (error) {
+        if (_previewFile?.path != file.path) return;
+        _previewError = '预览加载失败: $error';
+        _appendLog(_previewError!);
+      } finally {
+        if (_previewFile?.path == file.path) {
+          _previewLoading = false;
+          notifyListeners();
+        }
+      }
       return;
     }
 
+    // 非文本文件 → 作为图片/二进制下载
     _previewLoading = true;
     notifyListeners();
 
@@ -1307,7 +1380,18 @@ class FileManagerController extends ChangeNotifier {
       if (_previewFile?.path != file.path) {
         return;
       }
-      _previewImageBytes = bytes;
+      if (_isPdfFile(file)) {
+        final pages = await _renderPdfAllPages(bytes);
+        _previewPdfPages = pages;
+        if (pages != null && pages.isNotEmpty) {
+          _previewImageBytes = pages.first;
+          _appendLog('已渲染 PDF 预览 (${pages.length} 页)');
+        } else {
+          _previewError = 'PDF 渲染失败，请查看操作日志';
+        }
+      } else {
+        _previewImageBytes = bytes;
+      }
       _previewTransferredBytes = bytes.length;
       _previewTotalBytes ??= bytes.length;
       _appendLog(
@@ -1324,6 +1408,74 @@ class FileManagerController extends ChangeNotifier {
         _previewLoading = false;
         notifyListeners();
       }
+    }
+  }
+
+  /// 综合 indexedName / systemName / extension 字段判断文件扩展名
+  static bool _fileHasExtension(ManagedFile file, Set<String> extensions) {
+    final candidates = <String>{
+      file.indexedName.toLowerCase(),
+      file.systemName.toLowerCase(),
+      if (file.extension != null && file.extension!.isNotEmpty)
+        '.${file.extension!.toLowerCase()}',
+    };
+    return candidates.any(
+      (name) => extensions.any((ext) => name.endsWith(ext)),
+    );
+  }
+
+  bool _isPreviewableTextFile(ManagedFile file) {
+    const textExtensions = <String>{
+      '.txt', '.md', '.json', '.xml', '.csv', '.log',
+      '.yaml', '.yml', '.ini', '.cfg', '.conf', '.sh',
+      '.bat', '.py', '.js', '.ts', '.dart', '.html', '.css',
+      '.c', '.cpp', '.h', '.java', '.kt', '.swift', '.rs',
+      '.php', '.rb', '.go', '.sql', '.lua', '.pl', '.r',
+    };
+    if (_fileHasExtension(file, textExtensions)) return true;
+    return file.mimeType.startsWith('text/');
+  }
+
+  bool _isPdfFile(ManagedFile file) {
+    return _fileHasExtension(file, const {'.pdf'});
+  }
+
+  /// 使用 pdfx 渲染 PDF 每一页为独立 PNG（最多前 20 页，1200px 宽）
+  Future<List<Uint8List>?> _renderPdfAllPages(Uint8List pdfBytes) async {
+    PdfDocument? document;
+    try {
+      document = await PdfDocument.openData(pdfBytes);
+      final totalPages = document.pagesCount;
+      if (totalPages < 1) return null;
+
+      final maxPages = totalPages < 20 ? totalPages : 20;
+      final pageImages = <Uint8List>[];
+      const previewWidth = 1200.0;
+
+      for (var pageNum = 1; pageNum <= maxPages; pageNum++) {
+        final page = await document.getPage(pageNum);
+        try {
+          final aspectRatio =
+              page.height > 0 ? page.width / page.height : 1.0 / 1.414;
+          final pageImage = await page.render(
+            width: previewWidth,
+            height: previewWidth / aspectRatio,
+            format: PdfPageImageFormat.png,
+          );
+          if (pageImage?.bytes != null && pageImage!.bytes.isNotEmpty) {
+            pageImages.add(Uint8List.fromList(pageImage.bytes));
+          }
+        } finally {
+          await page.close();
+        }
+      }
+
+      return pageImages.isEmpty ? null : pageImages;
+    } catch (error) {
+      _appendLog('PDF 页面渲染失败: $error');
+      return null;
+    } finally {
+      await document?.close();
     }
   }
 
@@ -1368,6 +1520,7 @@ class FileManagerController extends ChangeNotifier {
   Future<bool> createFolder({
     required String name,
     String? parentId,
+    String visibility = 'public',
     bool encrypted = false,
     bool allowDirectDownload = false,
     String? password,
@@ -1379,6 +1532,7 @@ class FileManagerController extends ChangeNotifier {
         publicKeyPem: _requirePublicKey(_publicKeyPem),
         name: name,
         parentId: parentId,
+        visibility: visibility,
         encrypted: encrypted,
         allowDirectDownload: allowDirectDownload,
         password: password,
@@ -2222,6 +2376,16 @@ class FileManagerController extends ChangeNotifier {
       ..addAll(widths);
     final preferences = await SharedPreferences.getInstance();
     await _persistColumnWidths(preferences);
+    notifyListeners();
+  }
+
+  /// 设置图片预览自动加载阈值级别（0~21，指数级）。
+  Future<void> setPreviewThresholdLevel(int level) async {
+    final clamped = level.clamp(0, _previewThresholdMaxLevel);
+    if (_previewThresholdLevel == clamped) return;
+    _previewThresholdLevel = clamped;
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setInt(_previewThresholdPreferenceKey, clamped);
     notifyListeners();
   }
 

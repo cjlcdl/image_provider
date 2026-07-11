@@ -49,6 +49,7 @@ from server_storage import (
     create_file_record,
     create_upload_session,
     ensure_storage,
+    get_file_by_system_name,
     get_file_by_url,
     get_upload_session,
     is_ip_blacklisted,
@@ -543,6 +544,16 @@ async def handle_resumable_complete(
     if session is None or session.upload_token != upload_token.strip():
         raise HTTPException(status_code=404, detail="upload session not found")
 
+    # 会话已完成：幂等返回已有的文件信息
+    if session.status == "completed":
+        existing_file = await get_file_by_system_name(db, session.system_name)
+        if existing_file is not None:
+            return JSONResponse(status_code=200, content={
+                "code": 0, "message": "upload already completed",
+                "data": build_file_response(existing_file),
+            })
+        # 会话标记完成但元数据丢失，继续尝试重新完成
+
     total = int(session.total_size)
     uploaded = int(session.uploaded_size)
     if uploaded < total:
@@ -557,6 +568,13 @@ async def handle_resumable_complete(
 
     chunk_path = upload_chunk_path(upload_id)
     if total > 0 and (not chunk_path.exists() or chunk_path.stat().st_size < total):
+        # 分片文件缺失：可能已被之前的完成流程清理，尝试从DB查找
+        existing_file = await get_file_by_system_name(db, session.system_name)
+        if existing_file is not None:
+            return JSONResponse(status_code=200, content={
+                "code": 0, "message": "upload already completed",
+                "data": build_file_response(existing_file),
+            })
         return JSONResponse(
             status_code=409,
             content={

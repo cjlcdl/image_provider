@@ -302,10 +302,81 @@ class ImageBedClient {
     return _decodeJsonResponse(response);
   }
 
+  /// 创建分享链接
+  Future<Map<String, dynamic>> createShareLink({
+    required String publicKeyPem,
+    required String resourceType,
+    String? filePath,
+    String? folderId,
+    String? folderPassword,
+    int expiresInDays = 7,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final request = http.Request('POST', _buildUri('/api/share-links'));
+    request.headers.addAll(_buildRequestHeaders(
+      _mergeHeaders(
+        _buildManagementHeaders(publicKeyPem: publicKeyPem, nonce: nonce, timestamp: timestamp),
+        _buildFolderPasswordHeaders(
+          publicKeyPem: publicKeyPem, folderId: folderId, password: folderPassword,
+        ),
+      ),
+    ));
+    request.headers['Content-Type'] = 'application/json; charset=utf-8';
+    request.bodyBytes = utf8.encode(jsonEncode(<String, dynamic>{
+      'resourceType': resourceType,
+      if (resourceType == 'file') 'filePath': filePath,
+      if (resourceType == 'folder') 'folderId': folderId,
+      'expiresInDays': expiresInDays.clamp(1, 365),
+    }));
+
+    final response = await http.Response.fromStream(await _httpClient.send(request));
+    return _decodeJsonResponse(response);
+  }
+
+  /// 列出资源的分享链接
+  Future<Map<String, dynamic>> listShareLinks({
+    required String publicKeyPem,
+    String resourceType = 'file',
+    String? filePath,
+    String? folderId,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final queryParameters = <String, String>{
+      'resourceType': resourceType,
+      'filePath': ?filePath,
+      'folderId': ?folderId,
+    };
+    final response = await _httpClient.get(
+      _buildUri('/api/share-links').replace(queryParameters: queryParameters),
+      headers: _buildRequestHeaders(
+        _buildManagementHeaders(publicKeyPem: publicKeyPem, nonce: nonce, timestamp: timestamp),
+      ),
+    );
+    return _decodeJsonResponse(response);
+  }
+
+  /// 撤销分享链接
+  Future<Map<String, dynamic>> revokeShareLink({
+    required String publicKeyPem,
+    required String linkId,
+    String? nonce,
+    int? timestamp,
+  }) async {
+    final request = http.Request('DELETE', _buildUri('/api/share-links/$linkId'));
+    request.headers.addAll(_buildRequestHeaders(
+      _buildManagementHeaders(publicKeyPem: publicKeyPem, nonce: nonce, timestamp: timestamp),
+    ));
+    final response = await http.Response.fromStream(await _httpClient.send(request));
+    return _decodeJsonResponse(response);
+  }
+
   Future<Map<String, dynamic>> createFolder({
     required String publicKeyPem,
     required String name,
     String? parentId,
+    String visibility = 'public',
     bool encrypted = false,
     bool allowDirectDownload = false,
     String? password,
@@ -329,8 +400,8 @@ class ImageBedClient {
       jsonEncode(<String, dynamic>{
         'name': name,
         'parentId': parentId,
-        'encrypted': encrypted,
-        'allowDirectDownload': allowDirectDownload,
+        'visibility': visibility,
+        'encrypted': encrypted || visibility == 'encrypted',
         if (password != null && password.isNotEmpty) 'password': password,
       }),
     );

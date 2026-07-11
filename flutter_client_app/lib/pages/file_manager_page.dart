@@ -19,6 +19,7 @@ import 'package:courage_storage/widgets/detail_table.dart';
 import 'package:cross_file/cross_file.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -34,7 +35,7 @@ class FileManagerPage extends StatefulWidget {
 }
 
 class _FileManagerPageState extends State<FileManagerPage> {
-  static const int _manualPreviewThresholdBytes = 2 * 1024 * 1024;
+  int _manualPreviewThresholdBytes = 2097152; // 2 MB 默认
 
   late final FileManagerController _controller;
   late final bool _ownsController;
@@ -45,6 +46,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
   int _currentIndex = 0;
   bool _batchMode = false;
   bool _draggingUpload = false;
+  bool _wasDetailView = false;
   String _storageFilter = '';
   String? _dropTargetFolderId;
   bool _contextMenuOpen = false;
@@ -61,12 +63,30 @@ class _FileManagerPageState extends State<FileManagerPage> {
   }
 
   IconData _folderIcon(IndexedFolder folder) {
-    if (!folder.encrypted) {
-      return Icons.folder_outlined;
+    final vis = folder.effectiveVisibility;
+    if (vis == 'encrypted') {
+      return _controller.isFolderUnlocked(folder.id)
+          ? Icons.lock_open_rounded
+          : Icons.lock_outline_rounded;
     }
-    return _controller.isFolderUnlocked(folder.id)
-        ? Icons.lock_open_rounded
-        : Icons.lock_outline_rounded;
+    if (vis == 'private') {
+      return Icons.folder_shared_outlined;
+    }
+    return Icons.folder_outlined;
+  }
+
+  String _folderSubtitle(IndexedFolder folder) {
+    final vis = folder.effectiveVisibility;
+    final path = folder.path;
+    if (vis == 'encrypted') {
+      return _controller.isFolderUnlocked(folder.id)
+          ? '$path  ·  已解锁'
+          : '$path  ·  加密';
+    }
+    if (vis == 'private') {
+      return '$path  ·  私密';
+    }
+    return path;
   }
 
   List<_BrowserEntry> get _browserEntries {
@@ -125,6 +145,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
       if (!mounted || !widget.autoLoad) {
         return;
       }
+      _manualPreviewThresholdBytes = _controller.previewThresholdBytes;
       await _loadInitialFiles();
     });
 
@@ -174,6 +195,54 @@ class _FileManagerPageState extends State<FileManagerPage> {
     return Uri.parse(_controller.baseUrl)
         .resolve(normalized.startsWith('/') ? normalized : '/$normalized')
         .toString();
+  }
+
+  /// 综合 indexedName / systemName / extension 字段判断文件扩展名
+  bool _fileHasExtension(ManagedFile file, Set<String> extensions) {
+    final candidates = <String>{
+      file.indexedName.toLowerCase(),
+      file.systemName.toLowerCase(),
+      if (file.extension != null && file.extension!.isNotEmpty)
+        '.${file.extension!.toLowerCase()}',
+    };
+    return candidates.any(
+      (name) => extensions.any((ext) => name.endsWith(ext)),
+    );
+  }
+
+  bool _isImageFile(ManagedFile file) {
+    const imageExtensions = <String>{
+      '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+      '.svg', '.ico', '.tiff', '.tif', '.avif', '.heic',
+    };
+    if (_fileHasExtension(file, imageExtensions)) return true;
+    return file.mimeType.startsWith('image/');
+  }
+
+  bool _isOfficeDocument(ManagedFile file) {
+    const officeExtensions = <String>{
+      '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    };
+    return _fileHasExtension(file, officeExtensions);
+  }
+
+  bool _isTextFile(ManagedFile file) {
+    const textExtensions = <String>{
+      '.txt', '.md', '.json', '.xml', '.csv', '.log',
+      '.yaml', '.yml', '.ini', '.cfg', '.sh', '.bat',
+      '.py', '.js', '.ts', '.dart', '.html', '.css',
+      '.c', '.cpp', '.h', '.java', '.kt', '.swift', '.rs',
+      '.php', '.rb', '.go', '.sql', '.lua', '.pl', '.r',
+    };
+    if (_fileHasExtension(file, textExtensions)) return true;
+    return file.mimeType.startsWith('text/');
+  }
+
+  bool _isPreviewable(ManagedFile file) =>
+      _isImageFile(file) || _isPdfFile(file) || _isTextFile(file);
+
+  bool _isPdfFile(ManagedFile file) {
+    return _fileHasExtension(file, const {'.pdf'});
   }
 
   void _syncQueryFromInputs() {
@@ -289,62 +358,6 @@ class _FileManagerPageState extends State<FileManagerPage> {
     );
   }
 
-  Future<void> _copyFileLink(ManagedFile file) async {
-    final folder = _controller.folderById(file.folderId);
-    var expiresInDays = 7;
-    if (folder?.encrypted == true && folder?.allowDirectDownload == false) {
-      var expiresInput = '7';
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) {
-          return AlertDialog(
-            title: const Text('生成临时下载链接'),
-            content: TextFormField(
-              initialValue: expiresInput,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: '有效天数'),
-              onChanged: (value) {
-                expiresInput = value;
-              },
-            ),
-            actions: <Widget>[
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('取消'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(context).pop(true),
-                child: const Text('生成'),
-              ),
-            ],
-          );
-        },
-      );
-      if (confirmed != true) {
-        return;
-      }
-      expiresInDays = int.tryParse(expiresInput.trim()) ?? 7;
-    }
-
-    final generatedPath = await _controller.createShareLink(
-      file,
-      expiresInDays: expiresInDays,
-    );
-    final rawUrl = (generatedPath ?? file.url).trim();
-    final resolvedUrl = rawUrl.isNotEmpty
-        ? _resolveAbsoluteUrl(rawUrl)
-        : _resolveAbsoluteUrl(file.path);
-
-    await Clipboard.setData(ClipboardData(text: resolvedUrl));
-    if (!mounted) {
-      return;
-    }
-
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('文件链接已复制到剪切板')));
-  }
-
   Future<void> _chooseDownloadDirectory() async {
     final directoryPath = await FilePicker.getDirectoryPath(
       dialogTitle: '选择固定下载目录',
@@ -367,13 +380,14 @@ class _FileManagerPageState extends State<FileManagerPage> {
     final folder = _controller.folderById(file.folderId);
     final disableDirectDownload =
         folder?.encrypted == true && folder?.allowDirectDownload == false;
+    final isPreviewable = _isPreviewable(file);
     final needsManualPreview =
         !disableDirectDownload &&
-        file.mimeType.startsWith('image/') &&
+        isPreviewable &&
         file.size > _manualPreviewThresholdBytes;
     var previewRequested = !needsManualPreview && !disableDirectDownload;
 
-    if (previewRequested) {
+    if (previewRequested && isPreviewable) {
       _controller.loadPreview(file);
     }
 
@@ -409,6 +423,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
                       : _buildPreviewBody(
                           file,
                           _controller.previewImageBytes,
+                          _controller.previewPdfPages,
                           _controller.previewError,
                         );
 
@@ -835,6 +850,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
     ManagedFile file, {
     required VoidCallback onLoadPressed,
   }) {
+    final isImage = _isImageFile(file);
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFFF7F7F7),
@@ -846,21 +862,21 @@ class _FileManagerPageState extends State<FileManagerPage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
-              const Icon(
-                Icons.image_outlined,
+              Icon(
+                isImage ? Icons.image_outlined : Icons.description_outlined,
                 size: 64,
-                color: Color(0xFF8A8A8A),
+                color: const Color(0xFF8A8A8A),
               ),
               const SizedBox(height: 12),
               Text(
-                '该图片较大，当前大小为 ${ManagedFileTile.formatSize(file.size)}。',
+                '该文件较大，当前大小为 ${ManagedFileTile.formatSize(file.size)}。',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
               const SizedBox(height: 12),
               FilledButton(
                 onPressed: onLoadPressed,
-                child: const Text('加载图片'),
+                child: const Text('加载预览'),
               ),
             ],
           ),
@@ -1181,8 +1197,8 @@ class _FileManagerPageState extends State<FileManagerPage> {
     final success = await _controller.createFolder(
       name: result.name,
       parentId: parentFolderId,
+      visibility: result.visibility,
       encrypted: result.encrypted,
-      allowDirectDownload: result.allowDirectDownload,
       password: result.password,
       parentFolderPassword: _controller.unlockedFolderPassword(parentFolderId),
     );
@@ -1198,13 +1214,14 @@ class _FileManagerPageState extends State<FileManagerPage> {
   Future<void> _showMoveItemsToFolderDialog({
     List<ManagedFile> files = const <ManagedFile>[],
     List<IndexedFolder> folders = const <IndexedFolder>[],
+    String? targetFolderId,
   }) async {
     if (files.isEmpty && folders.isEmpty) {
       return;
     }
 
     final availableTargetFolders = _buildAvailableTargetFolders(folders);
-    String? selectedFolderId = _controller.currentFolderId;
+    String? selectedFolderId = targetFolderId ?? _controller.currentFolderId;
     if (selectedFolderId != null &&
         !availableTargetFolders.any(
           (folder) => folder.id == selectedFolderId,
@@ -2485,6 +2502,27 @@ class _FileManagerPageState extends State<FileManagerPage> {
     _showPreviewDialog(file);
   }
 
+  void _handleFileTapDesktop(ManagedFile file) {
+    if (_batchMode) {
+      final isSelected = _controller.selectedPaths.contains(file.path);
+      _controller.toggleSelection(file, !isSelected);
+      return;
+    }
+    final ctrl = HardwareKeyboard.instance.logicalKeysPressed
+        .intersection(<LogicalKeyboardKey>{
+          LogicalKeyboardKey.controlLeft,
+          LogicalKeyboardKey.controlRight,
+        })
+        .isNotEmpty;
+    if (ctrl) {
+      _controller.toggleSelection(
+          file, !_controller.selectedPaths.contains(file.path));
+    } else {
+      _controller.clearSelection();
+      _controller.toggleSelection(file, true);
+    }
+  }
+
   void _handleFileLongPress(ManagedFile file) {
     if (_batchMode) {
       final isSelected = _controller.selectedPaths.contains(file.path);
@@ -2509,6 +2547,27 @@ class _FileManagerPageState extends State<FileManagerPage> {
     _openFolder(folder.id);
   }
 
+  void _handleFolderTapDesktop(IndexedFolder folder) {
+    if (_batchMode) {
+      final isSelected = _controller.selectedFolderIds.contains(folder.id);
+      _controller.toggleFolderSelection(folder, !isSelected);
+      return;
+    }
+    final ctrl = HardwareKeyboard.instance.logicalKeysPressed
+        .intersection(<LogicalKeyboardKey>{
+          LogicalKeyboardKey.controlLeft,
+          LogicalKeyboardKey.controlRight,
+        })
+        .isNotEmpty;
+    if (ctrl) {
+      _controller.toggleFolderSelection(
+          folder, !_controller.selectedFolderIds.contains(folder.id));
+    } else {
+      _controller.clearSelection();
+      _controller.toggleFolderSelection(folder, true);
+    }
+  }
+
   void _handleFolderLongPress(IndexedFolder folder) {
     if (_batchMode) {
       final isSelected = _controller.selectedFolderIds.contains(folder.id);
@@ -2523,6 +2582,17 @@ class _FileManagerPageState extends State<FileManagerPage> {
     _showFolderActions(folder);
   }
 
+  Future<void> _showShareLinkDialog({ManagedFile? file, IndexedFolder? folder}) async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _ShareLinkDialog(
+        controller: _controller,
+        file: file,
+        folder: folder,
+      ),
+    );
+  }
+
   Future<void> _showFileActions(ManagedFile file) async {
     await showModalBottomSheet<void>(
       context: context,
@@ -2532,11 +2602,11 @@ class _FileManagerPageState extends State<FileManagerPage> {
           child: Wrap(
             children: <Widget>[
               ListTile(
-                leading: const Icon(Icons.link_rounded),
-                title: const Text('复制文件链接'),
+                leading: const Icon(Icons.share_outlined),
+                title: const Text('获取分享链接'),
                 onTap: () {
                   Navigator.of(sheetContext).pop();
-                  _copyFileLink(file);
+                  _showShareLinkDialog(file: file);
                 },
               ),
               ListTile(
@@ -2605,6 +2675,14 @@ class _FileManagerPageState extends State<FileManagerPage> {
                 onTap: () {
                   Navigator.of(sheetContext).pop();
                   _openFolder(folder.id);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.share_outlined),
+                title: const Text('获取分享链接'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _showShareLinkDialog(folder: folder);
                 },
               ),
               ListTile(
@@ -2680,50 +2758,59 @@ class _FileManagerPageState extends State<FileManagerPage> {
       children: <Widget>[
         Expanded(
           flex: 5,
-          child: AnimatedBuilder(
-            animation: _controller,
-            builder: (context, _) {
-              return PanelCard(
-                title: '空间概览',
-                child: Column(
-                  children: [
-                    SizedBox(
-                      width: double.infinity,
-                      child: StorageChart(
-                        pieSize: 140,
-                        segments: <StorageSegment>[
-                          StorageSegment(
-                            label: '已用空间',
-                            bytes: _controller.diskTotalBytes - _controller.diskFreeBytes,
-                            color: Theme.of(context).colorScheme.primary,
-                          ),
-                          StorageSegment(
-                            label: '可用空间',
-                            bytes: _controller.diskFreeBytes,
-                            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Wrap(
-                      spacing: 20,
-                      runSpacing: 12,
+          child: Column(
+            children: [
+              AnimatedBuilder(
+                animation: _controller,
+                builder: (context, _) {
+                  return PanelCard(
+                    title: '空间概览',
+                    child: Column(
                       children: [
-                        FilledButton.tonal(
-                          onPressed: _controller.busy ? null : _healthCheck,
-                          child: const Text('健康检查'),
+                        SizedBox(
+                          width: double.infinity,
+                          child: StorageChart(
+                            pieSize: 140,
+                            segments: <StorageSegment>[
+                              StorageSegment(
+                                label: '已用空间',
+                                bytes: _controller.diskTotalBytes - _controller.diskFreeBytes,
+                                color: Theme.of(context).colorScheme.primary,
+                              ),
+                              StorageSegment(
+                                label: '可用空间',
+                                bytes: _controller.diskFreeBytes,
+                                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                              ),
+                            ],
+                          ),
                         ),
-                        OutlinedButton(
-                          onPressed: _controller.busy ? null : _showServerLatencyDialog,
-                          child: const Text('测速'),
+                        const SizedBox(height: 16),
+                        Wrap(
+                          spacing: 20,
+                          runSpacing: 12,
+                          children: [
+                            FilledButton.tonal(
+                              onPressed: _controller.busy ? null : _healthCheck,
+                              child: const Text('健康检查'),
+                            ),
+                            OutlinedButton(
+                              onPressed: _controller.busy ? null : _showServerLatencyDialog,
+                              child: const Text('测速'),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                  ],
-                ),
-              );
-            },
+                  );
+                },
+              ),
+              const SizedBox(height: 16),
+              PanelCard(
+                title: '图片预览',
+                child: _buildPreviewThresholdSlider(),
+              ),
+            ],
           ),
         ),
         const SizedBox(width: 16),
@@ -2954,6 +3041,11 @@ class _FileManagerPageState extends State<FileManagerPage> {
         ),
         const SizedBox(height: 16),
         PanelCard(
+          title: '图片预览',
+          child: _buildPreviewThresholdSlider(),
+        ),
+        const SizedBox(height: 16),
+        PanelCard(
           title: '回收站',
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2977,7 +3069,177 @@ class _FileManagerPageState extends State<FileManagerPage> {
     );
   }
 
+  Widget _buildPreviewThresholdSlider() {
+    final level = _controller.previewThresholdLevel;
+    final desc = level <= 0 
+        ? '不自动加载预览'
+        : level >= 21
+        ? '总是自动加载预览'
+        : '大于 ${_thresholdLabel(level)} 的图片需手动点击加载预览';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(desc, style: Theme.of(context).textTheme.bodyMedium),
+        const SizedBox(height: 8),
+        Row(
+          children: <Widget>[
+            const Text('不加载', style: TextStyle(fontSize: 10)),
+            Expanded(
+              child: Slider(
+                value: level.toDouble(),
+                min: 0,
+                max: 21,
+                divisions: 21,
+                label: _thresholdLabel(level),
+                onChanged: (v) {
+                  final newLevel = v.round();
+                  _controller.setPreviewThresholdLevel(newLevel);
+                  _manualPreviewThresholdBytes =
+                      _controller.previewThresholdBytes;
+                },
+              ),
+            ),
+            const Text('总是加载', style: TextStyle(fontSize: 10)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  String _thresholdLabel(int level) {
+    if (level == 0) return '不加载';
+    if (level >= 21) return '总是加载';
+    final bytes = _controller.previewThresholdBytes;
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1048576) return '${bytes ~/ 1024} KB';
+    return '${bytes ~/ 1048576} MB';
+  }
+
   Widget _buildPreviewBody(
+    ManagedFile file,
+    Uint8List? imageBytes,
+    List<Uint8List>? pdfPages,
+    String? error,
+  ) {
+    if (_isPdfFile(file)) {
+      return _buildPdfPreview(file, imageBytes, pdfPages, error);
+    }
+    if (_isImageFile(file)) {
+      return _buildImagePreview(file, imageBytes, error);
+    }
+    if (_isOfficeDocument(file)) {
+      return _buildFileTypePreview(file);
+    }
+    if (_isTextFile(file)) {
+      return _buildTextPreview(file);
+    }
+    return _buildFileTypePreview(file);
+  }
+
+  Widget _buildPdfPreview(
+    ManagedFile file,
+    Uint8List? imageBytes,
+    List<Uint8List>? pdfPages,
+    String? error,
+  ) {
+
+    if (_controller.previewLoading && imageBytes == null) {
+      final totalBytes = _controller.previewTotalBytes;
+      final transferredBytes = _controller.previewTransferredBytes;
+      final progressValue = totalBytes == null || totalBytes <= 0
+          ? null
+          : transferredBytes / totalBytes;
+      final progressText = totalBytes == null || totalBytes <= 0
+          ? '已加载 ${ManagedFileTile.formatSize(transferredBytes)}'
+          : '${ManagedFileTile.formatSize(transferredBytes)} / ${ManagedFileTile.formatSize(totalBytes)}';
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 320),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const Icon(Icons.downloading_rounded, size: 56, color: Color(0xFF8A8A8A)),
+                  const SizedBox(height: 20),
+                  LinearProgressIndicator(value: progressValue),
+                  const SizedBox(height: 14),
+                  Text(
+                    progressValue == null ? '正在获取 PDF…' : '正在获取 PDF… ${(progressValue * 100).clamp(0, 100).toStringAsFixed(1)}%',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(progressText, textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (error != null) {
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(error, textAlign: TextAlign.center),
+          ),
+        ),
+      );
+    }
+
+    if (imageBytes == null) {
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: const Center(child: Text('PDF 数据为空')),
+      );
+    }
+
+    return GestureDetector(
+      onTap: () {
+        if (pdfPages != null && pdfPages.isNotEmpty) {
+          _openImageFullscreen(file, pdfPages.first, pdfPages: pdfPages);
+        } else {
+          _openImageFullscreen(file, imageBytes);
+        }
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.62),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Center(
+                child: Image.memory(imageBytes, fit: BoxFit.contain),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildImagePreview(
     ManagedFile file,
     Uint8List? imageBytes,
     String? error,
@@ -2986,10 +3248,6 @@ class _FileManagerPageState extends State<FileManagerPage> {
       color: Colors.white.withValues(alpha: 0.62),
       borderRadius: BorderRadius.circular(22),
     );
-
-    if (!file.mimeType.startsWith('image/')) {
-      return _buildFileTypePreview(file);
-    }
 
     if (_controller.previewLoading && imageBytes == null) {
       final totalBytes = _controller.previewTotalBytes;
@@ -3060,13 +3318,123 @@ class _FileManagerPageState extends State<FileManagerPage> {
       );
     }
 
+    return GestureDetector(
+      onTap: () {
+        _openImageFullscreen(file, imageBytes);
+      },
+      child: Container(
+        decoration: panelDecoration,
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Center(
+                child: Image.memory(imageBytes, fit: BoxFit.contain),
+              ),
+            ),
+            Positioned(
+              right: 8,
+              bottom: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.fullscreen, color: Colors.white70, size: 16),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openImageFullscreen(ManagedFile file, Uint8List bytes, {List<Uint8List>? pdfPages}) {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierDismissible: true,
+        barrierColor: Colors.black87,
+        transitionDuration: const Duration(milliseconds: 200),
+        pageBuilder: (_, _, _) => _ImageFullscreenViewer(
+          file: file,
+          imageBytes: bytes,
+          pdfPages: pdfPages,
+          onFileAction: (action) {
+            Navigator.of(context).pop();
+            _handleFileContextAction(file, action);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextPreview(ManagedFile file) {
+    final text = _controller.previewTextContent;
+    if (_controller.previewLoading && text == null) {
+      final transferredBytes = _controller.previewTransferredBytes;
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const SizedBox(width: 32, height: 32,
+                  child: CircularProgressIndicator(strokeWidth: 2.2)),
+              const SizedBox(height: 12),
+              Text(
+                '正在加载文本… ${ManagedFileTile.formatSize(transferredBytes)}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_controller.previewError != null) {
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(_controller.previewError!),
+          ),
+        ),
+      );
+    }
+    if (text == null) {
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF7F7F7),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: const Center(child: Text('无文本内容')),
+      );
+    }
     return Container(
-      decoration: panelDecoration,
-      clipBehavior: Clip.antiAlias,
-      child: Padding(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(12),
-        child: InteractiveViewer(
-          child: Center(child: Image.memory(imageBytes, fit: BoxFit.contain)),
+        child: SelectableText(
+          text,
+          style: const TextStyle(
+            fontFamily: 'monospace',
+            fontSize: 12,
+            height: 1.5,
+          ),
         ),
       ),
     );
@@ -3149,9 +3517,19 @@ class _FileManagerPageState extends State<FileManagerPage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isDetail = _isDetailView(constraints);
+        if (isDetail != _wasDetailView) {
+          _wasDetailView = isDetail;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _controller.clearSelection();
+          });
+        }
 
         if (entries.isEmpty) {
-          return _buildEmptyView();
+          final empty = RefreshIndicator(
+            onRefresh: _refreshFiles,
+            child: _buildEmptyView(),
+          );
+          return _wrapWithDrop(empty);
         }
 
         Widget content;
@@ -3175,35 +3553,40 @@ class _FileManagerPageState extends State<FileManagerPage> {
 
         if (!_supportsDesktopDrop) return content;
 
-        return DropTarget(
-          onDragEntered: (_) {
-            if (_controller.busy) return;
-            setState(() => _draggingUpload = true);
-          },
-          onDragExited: (_) {
-            if (!_draggingUpload) return;
-            setState(() => _draggingUpload = false);
-          },
-          onDragDone: (detail) async {
-            if (_draggingUpload && mounted) {
-              setState(() => _draggingUpload = false);
-            }
-            final droppedEntries = await _normalizeDroppedEntities(detail.files);
-            if (!mounted || droppedEntries.isEmpty) return;
-            await _showUploadDialog(
-              initialEntries: droppedEntries,
-              targetFolderId: _dropTargetFolderId,
-            );
-            _dropTargetFolderId = null;
-          },
-          child: Stack(
-            children: <Widget>[
-              Positioned.fill(child: content),
-              if (_draggingUpload) _buildDragOverlay(),
-            ],
-          ),
-        );
+        return _wrapWithDrop(content);
       },
+    );
+  }
+
+  Widget _wrapWithDrop(Widget child) {
+    if (!_supportsDesktopDrop) return child;
+    return DropTarget(
+      onDragEntered: (_) {
+        if (_controller.busy) return;
+        setState(() => _draggingUpload = true);
+      },
+      onDragExited: (_) {
+        if (!_draggingUpload) return;
+        setState(() => _draggingUpload = false);
+      },
+      onDragDone: (detail) async {
+        if (_draggingUpload && mounted) {
+          setState(() => _draggingUpload = false);
+        }
+        final droppedEntries = await _normalizeDroppedEntities(detail.files);
+        if (!mounted || droppedEntries.isEmpty) return;
+        await _showUploadDialog(
+          initialEntries: droppedEntries,
+          targetFolderId: _dropTargetFolderId,
+        );
+        _dropTargetFolderId = null;
+      },
+      child: Stack(
+        children: <Widget>[
+          Positioned.fill(child: child),
+          if (_draggingUpload) _buildDragOverlay(),
+        ],
+      ),
     );
   }
 
@@ -3248,10 +3631,18 @@ class _FileManagerPageState extends State<FileManagerPage> {
           _controller.toggleSelection(file, true);
         }
       },
+      onFolderTap: (folder, isCtrlHeld) {
+        if (isCtrlHeld) {
+          _controller.toggleFolderSelection(
+              folder, !_controller.selectedFolderIds.contains(folder.id));
+        } else {
+          _controller.clearSelection();
+          _controller.toggleFolderSelection(folder, true);
+        }
+      },
       onFileDoubleTap: (file) => _showPreviewDialog(file),
       onFolderDoubleTap: (folder) => _openFolder(folder.id),
-      onFileContextMenu: _supportsDesktopDrop
-          ? (file, position) {
+      onFileContextMenu: (file, position) {
               final selected = _controller.selectedFiles;
               if (selected.length > 1 &&
                   selected.any((f) => f.path == file.path)) {
@@ -3262,10 +3653,8 @@ class _FileManagerPageState extends State<FileManagerPage> {
                 _showDesktopContextMenu(
                     file: file, position: position);
               }
-            }
-          : null,
-      onFolderContextMenu: _supportsDesktopDrop
-          ? (folder, position) {
+            },
+      onFolderContextMenu: (folder, position) {
               final selected = _controller.selectedFolders;
               if (selected.length > 1 &&
                   selected.any((f) => f.id == folder.id)) {
@@ -3276,8 +3665,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
                 _showDesktopContextMenu(
                     folder: folder, position: position);
               }
-            }
-          : null,
+            },
       onToggleFileSelection: _controller.toggleSelection,
       onToggleFolderSelection: _controller.toggleFolderSelection,
       onSortChanged: (col) => _controller.setSortColumn(_columnName(col)),
@@ -3287,15 +3675,17 @@ class _FileManagerPageState extends State<FileManagerPage> {
         };
         _controller.saveColumnWidths(converted);
       },
-      onDragToFolder: _supportsDesktopDrop
-          ? (folder) => _dropTargetFolderId = folder.id
-          : null,
-      onFolderHover: _supportsDesktopDrop
-          ? (folder) => _dropTargetFolderId = folder.id
-          : null,
-      onFolderUnhover: _supportsDesktopDrop
-          ? () => _dropTargetFolderId = null
-          : null,
+      onDragToFolder: (folder) => _dropTargetFolderId = folder.id,
+      onFolderHover: (folder) => _dropTargetFolderId = folder.id,
+      onFolderUnhover: () => _dropTargetFolderId = null,
+      onFolderAcceptDrop: (folder, files) {
+        if (files.isNotEmpty) {
+          _showMoveItemsToFolderDialog(
+            files: files,
+            targetFolderId: folder.id,
+          );
+        }
+      },
       isDesktop: _supportsDesktopDrop,
       folderIcon: _folderIcon,
     );
@@ -3311,21 +3701,117 @@ class _FileManagerPageState extends State<FileManagerPage> {
         final entry = entries[index];
         if (entry.folder != null) {
           final folder = entry.folder!;
-          return _FolderListTile(
-            folder: folder,
-            icon: _folderIcon(folder),
-            selected: _controller.selectedFolderIds.contains(folder.id),
-            onTap: () => _handleFolderTap(folder),
-            onLongPress: () => _handleFolderLongPress(folder),
+          return DragTarget<List<ManagedFile>>(
+            onWillAcceptWithDetails: (_) => true,
+            onAcceptWithDetails: (details) {
+              final files = details.data;
+              if (files.isNotEmpty) {
+                _showMoveItemsToFolderDialog(
+                  files: files,
+                  targetFolderId: folder.id,
+                );
+              }
+            },
+            builder: (context, candidateData, rejectedData) {
+              final isHovering = candidateData.isNotEmpty;
+              Widget tile = _FolderListTile(
+                folder: folder,
+                icon: _folderIcon(folder),
+                selected: _controller.selectedFolderIds.contains(folder.id),
+                highlightDrop: isHovering,
+                subtitle: _folderSubtitle(folder),
+                onTap: _supportsDesktopDrop
+                    ? () => _handleFolderTapDesktop(folder)
+                    : () => _handleFolderTap(folder),
+                onLongPress: () => _handleFolderLongPress(folder),
+              );
+              if (_supportsDesktopDrop) {
+                tile = GestureDetector(
+                  onDoubleTap: () => _openFolder(folder.id),
+                  onSecondaryTapDown: (details) {
+                    final selected = _controller.selectedFolders;
+                    if (selected.length > 1 &&
+                        selected.any((f) => f.id == folder.id)) {
+                      _showDesktopContextMenu(
+                          folder: folder, position: details.globalPosition,
+                          isBatch: true, selectedFolders: selected);
+                    } else {
+                      _showDesktopContextMenu(
+                          folder: folder, position: details.globalPosition);
+                    }
+                  },
+                  child: tile,
+                );
+              }
+              return tile;
+            },
           );
         }
         final file = entry.file!;
-        return ManagedFileTile(
+        final isSelected = _controller.selectedPaths.contains(file.path);
+
+        Widget fileTile = ManagedFileTile(
           file: file,
-          selected: _controller.selectedPaths.contains(file.path),
-          onTap: () => _handleFileTap(file),
+          selected: isSelected,
+          onTap: _supportsDesktopDrop
+              ? () => _handleFileTapDesktop(file)
+              : () => _handleFileTap(file),
           onLongPress: () => _handleFileLongPress(file),
         );
+
+        // 桌面端：右击打开上下文菜单
+        if (_supportsDesktopDrop) {
+          fileTile = GestureDetector(
+            onSecondaryTapDown: (details) {
+              final selected = _controller.selectedFiles;
+              if (selected.length > 1 && selected.any((f) => f.path == file.path)) {
+                _showDesktopContextMenu(
+                    file: file, position: details.globalPosition,
+                    isBatch: true, selectedFiles: selected);
+              } else {
+                _showDesktopContextMenu(
+                    file: file, position: details.globalPosition);
+              }
+            },
+            child: fileTile,
+          );
+        }
+
+        // 桌面端：长按拖拽移动文件
+        if (_supportsDesktopDrop) {
+          fileTile = LongPressDraggable<List<ManagedFile>>(
+            data: () {
+              if (isSelected && _controller.hasSelection) {
+                return _controller.selectedFiles;
+              }
+              return <ManagedFile>[file];
+            }(),
+            delay: const Duration(milliseconds: 300),
+            feedback: Material(
+              elevation: 4,
+              borderRadius: BorderRadius.circular(12),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.drive_file_move_outline, size: 18),
+                    const SizedBox(width: 6),
+                    Text(
+                      isSelected && _controller.hasSelection
+                          ? '移动 ${_controller.selectedItemCount} 项'
+                          : '移动文件',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            child: fileTile,
+          );
+        }
+
+        return fileTile;
       },
     );
   }
@@ -3478,8 +3964,8 @@ class _FileManagerPageState extends State<FileManagerPage> {
   }
 
   List<PopupMenuEntry<String>> _fileContextMenuItems(ManagedFile file) => [
-    const PopupMenuItem(value: 'copyLink', child: ListTile(leading: Icon(Icons.link_rounded), title: Text('复制文件链接'), contentPadding: EdgeInsets.zero)),
     const PopupMenuItem(value: 'download', child: ListTile(leading: Icon(Icons.download_rounded), title: Text('下载到目录'), contentPadding: EdgeInsets.zero)),
+    PopupMenuItem(value: 'shareLink', child: ListTile(leading: const Icon(Icons.share_outlined), title: const Text('获取分享链接'), contentPadding: EdgeInsets.zero)),
     const PopupMenuItem(value: 'move', child: ListTile(leading: Icon(Icons.folder_open_rounded), title: Text('移动到...'), contentPadding: EdgeInsets.zero)),
     const PopupMenuItem(value: 'rename', child: ListTile(leading: Icon(Icons.drive_file_rename_outline_rounded), title: Text('重命名'), contentPadding: EdgeInsets.zero)),
     const PopupMenuItem(value: 'storage', child: ListTile(leading: Icon(Icons.drive_file_move_outline), title: Text('设置存储方式'), contentPadding: EdgeInsets.zero)),
@@ -3496,7 +3982,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
 
   Future<void> _handleFileContextAction(ManagedFile file, String action) async {
     switch (action) {
-      case 'copyLink': await _copyFileLink(file);
+      case 'shareLink': await _showShareLinkDialog(file: file);
       case 'download': await _downloadFile(file);
       case 'move': await _showMoveItemsToFolderDialog(files: [file]);
       case 'rename': await _showRenameDialog(file);
@@ -3622,7 +4108,19 @@ class _FileManagerPageState extends State<FileManagerPage> {
     return AnimatedBuilder(
       animation: _controller,
       builder: (context, _) {
-        return Scaffold(
+        return PopScope(
+          canPop: true,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            // 文件页且在子文件夹中 → 返回上一级
+            if (_currentIndex == 0 && _controller.currentFolderId != null) {
+              _openFolder(_controller.folderById(_controller.currentFolderId)?.parentId);
+              return;
+            }
+            // 否则允许退出
+            Navigator.of(context).pop();
+          },
+          child: Scaffold(
           extendBody: true,
           appBar: AppBar(
             titleSpacing: 20,
@@ -3738,6 +4236,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
               ),
             ],
           ),
+          ),
         );
       },
     );
@@ -3797,15 +4296,17 @@ class _ServerPresetSheetAction {
 class _CreateFolderDialogResult {
   const _CreateFolderDialogResult({
     required this.name,
+    required this.visibility,
+    required this.password,
     required this.encrypted,
     required this.allowDirectDownload,
-    required this.password,
   });
 
   final String name;
+  final String visibility;
+  final String password;
   final bool encrypted;
   final bool allowDirectDownload;
-  final String password;
 }
 
 enum _FolderManagementAction { save, delete }
@@ -3916,6 +4417,8 @@ class _FolderListTile extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.onLongPress,
+    this.subtitle,
+    this.highlightDrop = false,
   });
 
   final IndexedFolder folder;
@@ -3923,6 +4426,8 @@ class _FolderListTile extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
+  final String? subtitle;
+  final bool highlightDrop;
 
   @override
   Widget build(BuildContext context) {
@@ -3935,8 +4440,14 @@ class _FolderListTile extends StatelessWidget {
       height: 1.2,
     );
 
+    final bgColor = highlightDrop
+        ? Theme.of(context).colorScheme.primaryContainer
+        : selected
+        ? const Color(0xFFF3F3F3)
+        : Colors.white;
+
     return Material(
-      color: selected ? const Color(0xFFF3F3F3) : Colors.white,
+      color: bgColor,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
@@ -3969,7 +4480,7 @@ class _FolderListTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      folder.encrypted ? '${folder.path}  ·  加密' : folder.path,
+                      subtitle ?? (folder.encrypted ? '${folder.path}  ·  加密' : folder.path),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: metaStyle,
@@ -4021,8 +4532,7 @@ class _CreateFolderDialog extends StatefulWidget {
 class _CreateFolderDialogState extends State<_CreateFolderDialog> {
   late final TextEditingController _nameController;
   late final TextEditingController _passwordController;
-  bool _encrypted = false;
-  bool _allowDirectDownload = false;
+  String _visibility = 'public';
   String? _validationMessage;
 
   @override
@@ -4043,25 +4553,20 @@ class _CreateFolderDialogState extends State<_CreateFolderDialog> {
     final normalizedName = _nameController.text.trim();
     final normalizedPassword = _passwordController.text.trim();
     if (normalizedName.isEmpty) {
-      setState(() {
-        _validationMessage = '请输入文件夹名称';
-      });
+      setState(() { _validationMessage = '请输入文件夹名称'; });
       return;
     }
-    if (_encrypted && normalizedPassword.isEmpty) {
-      setState(() {
-        _validationMessage = '加密文件夹必须设置密码';
-      });
+    if (_visibility == 'encrypted' && normalizedPassword.isEmpty) {
+      setState(() { _validationMessage = '加密文件夹必须设置密码'; });
       return;
     }
-    Navigator.of(context).pop(
-      _CreateFolderDialogResult(
-        name: normalizedName,
-        encrypted: _encrypted,
-        allowDirectDownload: _allowDirectDownload,
-        password: normalizedPassword,
-      ),
-    );
+    Navigator.of(context).pop(_CreateFolderDialogResult(
+      name: normalizedName,
+      visibility: _visibility,
+      encrypted: _visibility == 'encrypted',
+      allowDirectDownload: false,
+      password: normalizedPassword,
+    ));
   }
 
   @override
@@ -4094,38 +4599,30 @@ class _CreateFolderDialogState extends State<_CreateFolderDialog> {
               ),
             ],
             const SizedBox(height: 12),
-            CheckboxListTile(
-              value: _encrypted,
-              contentPadding: EdgeInsets.zero,
+            DropdownButtonFormField<String>(
+              value: _visibility,
+              decoration: const InputDecoration(labelText: '可见性'),
+              items: const [
+                DropdownMenuItem(value: 'public', child: Text('公开（永久公开链接）')),
+                DropdownMenuItem(value: 'private', child: Text('非公开（客户端访问）')),
+                DropdownMenuItem(value: 'encrypted', child: Text('加密（需要密码）')),
+              ],
               onChanged: (value) {
                 setState(() {
-                  _encrypted = value ?? false;
+                  _visibility = value ?? 'public';
                   _validationMessage = null;
-                  if (!_encrypted) {
-                    _allowDirectDownload = false;
+                  if (_visibility != 'encrypted') {
                     _passwordController.clear();
                   }
                 });
               },
-              title: const Text('加密文件夹'),
             ),
-            if (_encrypted) ...<Widget>[
+            if (_visibility == 'encrypted') ...[
+              const SizedBox(height: 12),
               TextField(
                 controller: _passwordController,
                 obscureText: true,
                 decoration: const InputDecoration(labelText: '设置密码'),
-              ),
-              const SizedBox(height: 12),
-              CheckboxListTile(
-                value: _allowDirectDownload,
-                contentPadding: EdgeInsets.zero,
-                onChanged: (value) {
-                  setState(() {
-                    _allowDirectDownload = value ?? false;
-                    _validationMessage = null;
-                  });
-                },
-                title: const Text('允许直链免密下载'),
               ),
             ],
           ],
@@ -4372,6 +4869,341 @@ class _ServerLatencyDialogState extends State<_ServerLatencyDialog> {
   }
 }
 
+class _ImageFullscreenViewer extends StatefulWidget {
+  const _ImageFullscreenViewer({
+    required this.file,
+    required this.imageBytes,
+    this.pdfPages,
+    required this.onFileAction,
+  });
+
+  final ManagedFile file;
+  final Uint8List imageBytes;
+  final List<Uint8List>? pdfPages;
+  final void Function(String action) onFileAction;
+
+  @override
+  State<_ImageFullscreenViewer> createState() => _ImageFullscreenViewerState();
+}
+
+class _ImageFullscreenViewerState extends State<_ImageFullscreenViewer>
+    with SingleTickerProviderStateMixin {
+  final TransformationController _transform = TransformationController();
+  Size _viewportSize = Size.zero;
+  late final AnimationController _snapController;
+  late final CurvedAnimation _snapCurve;
+  Matrix4Tween? _snapTween;
+  Timer? _settleTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _snapController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+    );
+    _snapCurve = CurvedAnimation(
+      parent: _snapController,
+      curve: Curves.easeOutCubic,
+    );
+    _snapCurve.addListener(_onSnapTick);
+  }
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    _snapCurve.removeListener(_onSnapTick);
+    _snapCurve.dispose();
+    _snapController.dispose();
+    _transform.dispose();
+    super.dispose();
+  }
+
+  void _onSnapTick() {
+    if (_snapTween == null) return;
+    _transform.value = _snapTween!.transform(_snapCurve.value);
+  }
+
+  double get _currentScale {
+    final m = _transform.value;
+    return m.getMaxScaleOnAxis();
+  }
+
+  void _zoom(double delta) {
+    _cancelSnap();
+    final newScale = (_currentScale + delta).clamp(0.5, 8.0);
+    final size = _viewportSize;
+    if (size != Size.zero) {
+      final cx = size.width / 2;
+      final cy = size.height / 2;
+      final t = Matrix4.identity();
+      t.setEntry(0, 3, cx * (1 - newScale));
+      t.setEntry(1, 3, cy * (1 - newScale));
+      t.setEntry(0, 0, newScale);
+      t.setEntry(1, 1, newScale);
+      _transform.value = t;
+    }
+    // 缩放后自动居中回弹
+    _snapToCenter(animate: false);
+  }
+
+  /// 终止所有待执行/进行中的回弹动画
+  void _cancelSnap() {
+    _settleTimer?.cancel();
+    _snapController.stop();
+  }
+
+  /// 延迟触发回弹，等待 InteractiveViewer 惯性移动结束
+  void _scheduleSnap() {
+    _settleTimer?.cancel();
+    _settleTimer = Timer(const Duration(milliseconds: 180), () {
+      if (!mounted) return;
+      _snapToCenter();
+    });
+  }
+
+  void _snapToCenter({bool animate = true}) {
+    final matrix = _transform.value;
+    final scale = matrix.getMaxScaleOnAxis();
+    final screenW = _viewportSize.width;
+    final screenH = _viewportSize.height;
+    if (screenW <= 0 || screenH <= 0) return;
+
+    // 子控件实际尺寸：多页 PDF 时高度 = 屏幕高度 × 页数
+    final numPages = widget.pdfPages?.length ?? 1;
+    final childW = screenW;
+    final childH = screenH * numPages;
+
+    // 缩小回弹：scale < 1.0 时恢复到 1.0（宽度占满屏幕）
+    final fitScale = 1.0;
+    final effectiveScale = scale < fitScale - 0.01 ? fitScale : scale;
+
+    final scaledW = childW * effectiveScale;
+    final scaledH = childH * effectiveScale;
+    final translateX = matrix.getTranslation().x;
+    final translateY = matrix.getTranslation().y;
+
+    double targetX = translateX;
+    double targetY = translateY;
+
+    // 水平：仅当图片左右两边同时超出屏幕时才跳过居中
+    final leftEdge = translateX;
+    final rightEdge = translateX + scaledW;
+    final bothHEdgesExceed = leftEdge < -0.5 && rightEdge > screenW + 0.5;
+    if (!bothHEdgesExceed) {
+      targetX = (screenW - scaledW) / 2;
+    }
+
+    final topEdge = translateY;
+    final bottomEdge = translateY + scaledH;
+
+    if (numPages > 1) {
+      // 多页 PDF：垂直仅做首页顶部 / 末页底部回弹
+      final topVisible = topEdge > -0.5;
+      final bottomVisible = bottomEdge < screenH + 0.5;
+      if (topVisible && bottomVisible) {
+        targetY = (screenH - scaledH) / 2; // 内容适配屏幕 → 居中
+      } else if (topVisible) {
+        targetY = 0; // 首页顶部不留白
+      } else if (bottomVisible) {
+        targetY = screenH - scaledH; // 末页底部不留白
+      }
+    } else {
+      // 单图：垂直居中回弹（两边未同时超出时）
+      final bothVEdgesExceed =
+          topEdge < -0.5 && bottomEdge > screenH + 0.5;
+      if (!bothVEdgesExceed) {
+        targetY = (screenH - scaledH) / 2;
+      }
+    }
+
+    if ((targetX - translateX).abs() < 0.5 &&
+        (targetY - translateY).abs() < 0.5) {
+      return;
+    }
+
+    final targetMatrix = Matrix4.identity()
+      ..setEntry(0, 0, effectiveScale)
+      ..setEntry(1, 1, effectiveScale)
+      ..setEntry(0, 3, targetX)
+      ..setEntry(1, 3, targetY);
+
+    if (!animate) {
+      _transform.value = targetMatrix;
+      return;
+    }
+
+    _snapTween = Matrix4Tween(
+      begin: matrix,
+      end: targetMatrix,
+    );
+    _snapController
+      ..reset()
+      ..forward();
+  }
+
+  Widget _buildPageView(List<Uint8List> pages) {
+    final screenW = _viewportSize.width;
+    final screenH = _viewportSize.height;
+    final children = <Widget>[];
+    for (var i = 0; i < pages.length; i++) {
+      children.add(
+        SizedBox(
+          width: screenW,
+          height: screenH,
+          child: Image.memory(pages[i], fit: BoxFit.contain),
+        ),
+      );
+    }
+    return Column(children: children);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          _viewportSize = Size(constraints.maxWidth, constraints.maxHeight);
+          final isMultiPage =
+              widget.pdfPages != null && widget.pdfPages!.isNotEmpty;
+
+          return Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              Listener(
+                onPointerSignal: (event) {
+                  if (event is PointerScrollEvent) {
+                    _zoom(-event.scrollDelta.dy / 200);
+                  }
+                },
+                child: GestureDetector(
+                  onTap: () => Navigator.of(context).pop(),
+                  onLongPress: () => _showImageActionMenu(),
+                  onSecondaryTapDown: (details) =>
+                      _showImageContextMenu(details.globalPosition),
+                  child: InteractiveViewer(
+                    constrained: false,
+                    boundaryMargin: const EdgeInsets.all(double.infinity),
+                    transformationController: _transform,
+                    minScale: 0.5,
+                    maxScale: 8.0,
+                    onInteractionStart: (_) => _cancelSnap(),
+                    onInteractionEnd: (_) => _scheduleSnap(),
+                    child: isMultiPage
+                        ? _buildPageView(widget.pdfPages!)
+                        : SizedBox(
+                            width: constraints.maxWidth,
+                            height: constraints.maxHeight,
+                            child: Image.memory(
+                              widget.imageBytes,
+                              fit: BoxFit.contain,
+                            ),
+                          ),
+                  ),
+                ),
+              ),
+              // 关闭按钮
+              Positioned(
+                top: MediaQuery.of(context).padding.top + 4,
+                right: 8,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white70),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  void _showImageActionMenu() {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: <Widget>[
+            ListTile(
+              leading: const Icon(Icons.download_rounded),
+              title: const Text('下载到目录'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                widget.onFileAction('download');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.share_outlined),
+              title: const Text('获取分享链接'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                widget.onFileAction('shareLink');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.drive_file_rename_outline_rounded),
+              title: const Text('重命名'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                widget.onFileAction('rename');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline_rounded,
+                  color: Color(0xFF8C2F1B)),
+              title: const Text('删除文件',
+                  style: TextStyle(color: Color(0xFF8C2F1B))),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                widget.onFileAction('delete');
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showImageContextMenu(Offset position) {
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+          position.dx, position.dy, position.dx + 1, position.dy + 1),
+      items: <PopupMenuEntry<String>>[
+        const PopupMenuItem(
+            value: 'download',
+            child: ListTile(
+                leading: Icon(Icons.download_rounded),
+                title: Text('下载到目录'),
+                contentPadding: EdgeInsets.zero)),
+        const PopupMenuItem(
+            value: 'shareLink',
+            child: ListTile(
+                leading: Icon(Icons.share_outlined),
+                title: Text('获取分享链接'),
+                contentPadding: EdgeInsets.zero)),
+        const PopupMenuItem(
+            value: 'rename',
+            child: ListTile(
+                leading: Icon(Icons.drive_file_rename_outline_rounded),
+                title: Text('重命名'),
+                contentPadding: EdgeInsets.zero)),
+        const PopupMenuItem(
+            value: 'delete',
+            child: ListTile(
+                leading: Icon(Icons.delete_outline_rounded,
+                    color: Color(0xFF8C2F1B)),
+                title: Text('删除文件',
+                    style: TextStyle(color: Color(0xFF8C2F1B))),
+                contentPadding: EdgeInsets.zero)),
+      ],
+    ).then((action) {
+      if (action != null) widget.onFileAction(action);
+    });
+  }
+}
+
 class _TransferDialogState {
   const _TransferDialogState({
     required this.fileName,
@@ -4404,6 +5236,264 @@ class _TransferDialogState {
       transferredBytes: transferredBytes ?? this.transferredBytes,
       totalBytes: totalBytes ?? this.totalBytes,
       active: active ?? this.active,
+    );
+  }
+}
+
+
+// ===================================================================
+// 分享链接管理对话框
+// ===================================================================
+
+class _ShareLinkDialog extends StatefulWidget {
+  const _ShareLinkDialog({
+    required this.controller,
+    this.file,
+    this.folder,
+  });
+
+  final FileManagerController controller;
+  final ManagedFile? file;
+  final IndexedFolder? folder;
+
+  @override
+  State<_ShareLinkDialog> createState() => _ShareLinkDialogState();
+}
+
+class _ShareLinkDialogState extends State<_ShareLinkDialog> {
+  final TextEditingController _daysController = TextEditingController(text: '7');
+  bool _creating = false;
+  List<Map<String, dynamic>> _links = [];
+  bool _loadingLinks = true;
+  String? _error;
+
+  FileManagerController get _c => widget.controller;
+  ManagedFile? get _file => widget.file;
+  IndexedFolder? get _folder => widget.folder;
+
+  bool get _isPublic {
+    if (_folder != null) return _folder!.effectiveVisibility == 'public';
+    if (_file != null) return _file!.effectiveVisibility == 'public';
+    return true;
+  }
+
+  String get _resourceType => _file != null ? 'file' : 'folder';
+  String? get _filePath => _file?.path;
+  String? get _folderId => _folder?.id;
+
+  String? get _folderPassword {
+    final fid = _folder?.id ?? _file?.folderId;
+    if (fid == null) return null;
+    final folder = _c.folderById(fid);
+    if (folder?.effectiveVisibility == 'encrypted') {
+      return _c.unlockedFolderPassword(fid);
+    }
+    return null;
+  }
+
+  String get _permanentUrl {
+    final raw = _file?.url ?? _file?.path ?? '';
+    return _resolveAbsoluteUrl(raw);
+  }
+
+  String _resolveAbsoluteUrl(String raw) {
+    var url = raw.trim();
+    if (url.isEmpty) return '';
+    if (url.startsWith('http://') || url.startsWith('https://')) return url;
+    final base = _c.baseUrl.replaceAll(RegExp(r'/+$'), '');
+    if (!url.startsWith('/')) url = '/$url';
+    return '$base$url';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (!_isPublic) _loadShareLinks();
+    else _loadingLinks = false;
+  }
+
+  @override
+  void dispose() {
+    _daysController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadShareLinks() async {
+    setState(() { _loadingLinks = true; _error = null; });
+    try {
+      final client = ImageBedClient(baseUrl: _c.baseUrl);
+      final result = await client.listShareLinks(
+        publicKeyPem: Global.publicKeyPem,
+        resourceType: _resourceType,
+        filePath: _filePath,
+        folderId: _folderId,
+      );
+      final data = result['data'] as Map<String, dynamic>? ?? {};
+      final links = (data['links'] as List<dynamic>? ?? [])
+          .map((l) => Map<String, dynamic>.from(l as Map))
+          .toList();
+      setState(() { _links = links; _loadingLinks = false; });
+    } catch (e) {
+      setState(() { _error = e.toString(); _loadingLinks = false; });
+    }
+  }
+
+  Future<void> _createLink() async {
+    final daysText = _daysController.text.trim();
+    final days = int.tryParse(daysText) ?? 7;
+    if (days < 1 || days > 365) {
+      setState(() => _error = '有效天数必须在 1-365 之间');
+      return;
+    }
+    setState(() { _creating = true; _error = null; });
+    try {
+      final client = ImageBedClient(baseUrl: _c.baseUrl);
+      await client.createShareLink(
+        publicKeyPem: Global.publicKeyPem,
+        resourceType: _resourceType,
+        filePath: _filePath,
+        folderId: _folderId,
+        folderPassword: _folderPassword,
+        expiresInDays: days,
+      );
+      await _loadShareLinks();
+      setState(() => _creating = false);
+    } catch (e) {
+      setState(() { _error = e.toString(); _creating = false; });
+    }
+  }
+
+  Future<void> _revokeLink(String linkId) async {
+    try {
+      final client = ImageBedClient(baseUrl: _c.baseUrl);
+      await client.revokeShareLink(publicKeyPem: Global.publicKeyPem, linkId: linkId);
+      await _loadShareLinks();
+    } catch (e) {
+      setState(() => _error = e.toString());
+    }
+  }
+
+  Future<void> _copyText(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('链接已复制到剪切板')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('访问链接'),
+      content: SizedBox(
+        width: 440,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_file != null) ...[
+              Text(_file!.indexedName,
+                  style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(height: 4),
+            ],
+            if (_folder != null) ...[
+              Text(_folder!.name,
+                  style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(height: 4),
+            ],
+
+            // 公开：仅显示永久链接
+            if (_isPublic) ...[
+              const SizedBox(height: 8),
+              const Text('此资源为公开可见，访问链接永久有效',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: SelectableText(_permanentUrl,
+                      style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.copy, size: 20),
+                  onPressed: () => _copyText(_permanentUrl),
+                  tooltip: '复制链接',
+                ),
+              ]),
+            ] else ...[
+              // 非公开/加密：创建 + 列表
+              const SizedBox(height: 12),
+              Row(children: [
+                Expanded(
+                  child: TextField(
+                    controller: _daysController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: '有效天数 (1-365)',
+                      border: OutlineInputBorder(), isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                FilledButton.tonal(
+                  onPressed: _creating ? null : _createLink,
+                  child: _creating
+                      ? const SizedBox(width: 16, height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('创建新链接'),
+                ),
+              ]),
+              if (_error != null) ...[
+                const SizedBox(height: 8),
+                Text(_error!, style: TextStyle(
+                    color: Theme.of(context).colorScheme.error, fontSize: 12)),
+              ],
+              const SizedBox(height: 16),
+              Text('当前有效链接', style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(height: 8),
+              if (_loadingLinks)
+                const Center(child: CircularProgressIndicator())
+              else if (_links.isEmpty)
+                const Text('暂无有效分享链接', style: TextStyle(fontSize: 12, color: Colors.grey))
+              else
+                ..._links.map((link) {
+                  final token = link['token'] ?? '';
+                  final absUrl = _resolveAbsoluteUrl('/s/$token');
+                  final expiresAt = link['expiresAt'] ?? '';
+                  final accessCount = link['accessCount'] ?? 0;
+                  final expiryText = ManagedFileTile.formatUploadedAt(
+                      expiresAt.toString());
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 6),
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(children: [
+                            Expanded(
+                              child: SelectableText(absUrl,
+                                  style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+                            ),
+                            IconButton(icon: const Icon(Icons.copy, size: 18),
+                                onPressed: () => _copyText(absUrl), tooltip: '复制'),
+                            IconButton(icon: const Icon(Icons.close, size: 18, color: Colors.red),
+                                onPressed: () => _revokeLink(link['id']?.toString() ?? ''),
+                                tooltip: '撤销'),
+                          ]),
+                          Text('有效期至 $expiryText  ·  访问 $accessCount 次',
+                              style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('关闭')),
+      ],
     );
   }
 }

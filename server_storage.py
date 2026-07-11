@@ -46,7 +46,7 @@ from server_utils import (
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server_models import AuditLog, DownloadToken, Folder, StoredFile, UploadSession
+from server_models import AuditLog, DownloadToken, Folder, ShareLink, StoredFile, UploadSession
 
 
 # ===================================================================
@@ -177,12 +177,12 @@ async def get_file_by_id(db: AsyncSession, file_id: str) -> Optional[StoredFile]
 
 
 async def get_file_by_system_name(db: AsyncSession, system_name: str) -> Optional[StoredFile]:
-    """通过系统文件名（sha256.ext）查询文件（排除已软删除）"""
+    """通过系统文件名（sha256.ext）查询文件（排除已软删除，去重场景取第一条）"""
     result = await db.execute(
         select(StoredFile).where(
             StoredFile.system_name == system_name,
             StoredFile.deleted_at.is_(None),
-        )
+        ).limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -334,11 +334,10 @@ async def permanent_delete_file(db: AsyncSession, file_id: str) -> Optional[Stor
     await db.delete(record)
     await db.flush()
 
-    # 无其他引用才删物理文件
+    # 无其他记录引用同一 SHA-256 时才删物理文件（含已删除记录，确保回收站可恢复）
     ref_result = await db.execute(
         select(func.count()).select_from(StoredFile).where(
             StoredFile.sha256 == sha256,
-            StoredFile.deleted_at.is_(None),
         )
     )
     if (ref_result.scalar() or 0) == 0:
@@ -442,8 +441,16 @@ async def record_file_access(db: AsyncSession, file_id: str) -> None:
     await db.flush()
 
 
-def build_file_response(record: StoredFile) -> Dict[str, Any]:
-    """将 StoredFile ORM 对象转换为 API 响应字典"""
+def build_file_response(
+    record: StoredFile,
+    effective_visibility: str = "public",
+) -> Dict[str, Any]:
+    """将 StoredFile ORM 对象转换为 API 响应字典
+
+    Args:
+        record: 文件记录
+        effective_visibility: 文件的有效可见性（继承父文件夹链中最严格的级别）
+    """
     url = get_file_url(record.system_name)
     return {
         "fileId": record.file_id,
@@ -457,6 +464,7 @@ def build_file_response(record: StoredFile) -> Dict[str, Any]:
         "path": url,
         "url": url,
         "folderId": record.folder_id or None,
+        "effectiveVisibility": effective_visibility,
         "uploadedBy": record.uploaded_by,
         "appChannel": record.app_channel,
         "createdAt": format_utc_iso(record.created_at),
@@ -477,6 +485,7 @@ async def create_folder_record(
     *,
     name: str,
     parent_id: Optional[str] = None,
+    visibility: str = "public",
     encrypted: bool = False,
     password: Optional[str] = None,
     allow_direct_download: bool = True,
@@ -486,21 +495,25 @@ async def create_folder_record(
     Args:
         name: 文件夹名称
         parent_id: 父文件夹 ID（None 表示根级）
-        encrypted: 是否加密
-        password: 加密密码（encrypted=True 时必填）
-        allow_direct_download: 是否允许直接下载
+        visibility: 可见性（public/private/encrypted，默认 public）
+        encrypted: 兼容旧参数
+        password: 加密密码（visibility=encrypted 时必填）
+        allow_direct_download: 兼容旧参数
 
     Returns:
         新创建的 Folder ORM 对象
 
     Raises:
         PermissionError: 加密文件夹未提供密码
+        ValueError: 无效的 visibility 值
     """
     import uuid
 
     from server_auth import _generate_password_hash
 
-    if encrypted and not password:
+    if visibility not in ("public", "private", "encrypted"):
+        raise ValueError("invalid visibility")
+    if visibility == "encrypted" and not password:
         raise PermissionError("missing folder password")
 
     folder_id = uuid.uuid4().hex
@@ -510,12 +523,13 @@ async def create_folder_record(
         id=folder_id,
         name=name,
         parent_id=parent_id,
-        encrypted=encrypted,
-        allow_direct_download=allow_direct_download if encrypted else True,
+        visibility=visibility,
+        encrypted=(visibility == "encrypted"),
+        allow_direct_download=allow_direct_download if visibility != "encrypted" else False,
         created_at=now_ts,
         updated_at=now_ts,
     )
-    if encrypted and password:
+    if visibility == "encrypted" and password:
         pw_data = _generate_password_hash(password)
         record.password_salt = pw_data["passwordSalt"]
         record.password_hash = pw_data["passwordHash"]
@@ -659,12 +673,17 @@ async def delete_folder_cascade(db: AsyncSession, folder_id: str) -> List[str]:
     return all_ids
 
 
-def build_folder_response(record: Folder, all_folders: Dict[str, "Folder"]) -> Dict[str, Any]:
+def build_folder_response(
+    record: Folder,
+    all_folders: Dict[str, "Folder"],
+    effective_visibility: str = "public",
+) -> Dict[str, Any]:
     """将 Folder ORM 对象转为 API 响应字典
 
     Args:
         record: 文件夹 ORM 对象
         all_folders: 所有文件夹的 {id: Folder} 字典，用于构建路径
+        effective_visibility: 有效可见性（继承父链中最严格的级别）
     """
     # 构建路径
     names = []
@@ -687,6 +706,8 @@ def build_folder_response(record: Folder, all_folders: Dict[str, "Folder"]) -> D
         "id": record.id,
         "name": record.name,
         "parentId": record.parent_id,
+        "visibility": record.visibility or "public",
+        "effectiveVisibility": effective_visibility,
         "encrypted": record.encrypted,
         "allowDirectDownload": record.allow_direct_download,
         "createdAt": format_utc_iso(record.created_at),
@@ -748,6 +769,136 @@ async def _prune_download_tokens(db: AsyncSession) -> None:
     """清理过期的下载令牌"""
     await db.execute(
         delete(DownloadToken).where(DownloadToken.expires_at <= now_utc())
+    )
+    await db.flush()
+
+
+# ===================================================================
+# 文件夹可见性检查
+# ===================================================================
+
+async def get_folder_visibility_chain(
+    db: AsyncSession, folder_id: str
+) -> Optional[str]:
+    """获取文件夹及其所有父级的可见性链中最严格的级别
+
+    返回：None=文件夹不存在, 'public', 'private', 'encrypted'
+    规则：沿父级链向上查找，返回最严格的级别（encrypted > private > public）
+    """
+    if not folder_id:
+        return "public"  # 根目录始终公开
+
+    current_id = folder_id
+    max_level = "public"
+    seen = set()
+    level_map = {"public": 0, "private": 1, "encrypted": 2}
+
+    while current_id:
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        result = await db.execute(select(Folder).where(Folder.id == current_id))
+        folder = result.scalar_one_or_none()
+        if folder is None:
+            break
+        vis = folder.visibility or "public"
+        if level_map.get(vis, 0) > level_map.get(max_level, 0):
+            max_level = vis
+        current_id = folder.parent_id
+
+    return max_level
+
+
+# ===================================================================
+# 分享链接管理
+# ===================================================================
+
+async def create_share_link(
+    db: AsyncSession,
+    *,
+    resource_type: str,
+    file_path: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+    expires_days: int = 7,
+) -> "ShareLink":
+    """创建分享链接"""
+    import secrets
+    import uuid
+
+    bounded_days = max(1, min(expires_days, 365))
+    expires_at = now_utc() + timedelta(days=bounded_days)
+    token = secrets.token_urlsafe(32)
+
+    record = ShareLink(
+        id=uuid.uuid4().hex,
+        token=token,
+        resource_type=resource_type,
+        file_path=file_path,
+        folder_id=folder_id,
+        created_by=created_by,
+        expires_at=expires_at,
+        created_at=now_utc(),
+    )
+    db.add(record)
+    await db.flush()
+    return record
+
+
+async def get_share_link_by_token(db: AsyncSession, token: str) -> Optional["ShareLink"]:
+    """按令牌查找有效的分享链接"""
+    result = await db.execute(
+        select(ShareLink).where(
+            ShareLink.token == token,
+            ShareLink.revoked_at.is_(None),
+            ShareLink.expires_at > now_utc(),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_share_links_for_resource(
+    db: AsyncSession,
+    *,
+    resource_type: str,
+    file_path: Optional[str] = None,
+    folder_id: Optional[str] = None,
+) -> List["ShareLink"]:
+    """列出某资源所有有效的分享链接"""
+    conditions = [
+        ShareLink.resource_type == resource_type,
+        ShareLink.revoked_at.is_(None),
+    ]
+    if resource_type == "file" and file_path:
+        conditions.append(ShareLink.file_path == file_path)
+    elif resource_type == "folder" and folder_id:
+        conditions.append(ShareLink.folder_id == folder_id)
+    else:
+        return []
+
+    result = await db.execute(
+        select(ShareLink).where(and_(*conditions)).order_by(ShareLink.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def revoke_share_link(db: AsyncSession, link_id: str) -> bool:
+    """撤销分享链接"""
+    result = await db.execute(select(ShareLink).where(ShareLink.id == link_id))
+    record = result.scalar_one_or_none()
+    if record is None:
+        return False
+    record.revoked_at = now_utc()
+    await db.flush()
+    return True
+
+
+async def record_share_link_access(db: AsyncSession, token: str) -> None:
+    """记录分享链接访问"""
+    await db.execute(
+        update(ShareLink)
+        .where(ShareLink.token == token)
+        .values(access_count=ShareLink.access_count + 1)
     )
     await db.flush()
 

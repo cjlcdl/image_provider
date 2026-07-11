@@ -71,7 +71,14 @@ async def handle_list_folders(
 
     folders = await list_all_folders(db)
     folder_map = {f.id: f for f in folders}
-    folder_list = [build_folder_response(f, folder_map) for f in folders]
+    from server_storage import get_folder_visibility_chain
+    vis_cache: dict = {}
+    folder_list = []
+    for f in folders:
+        fid = f.id
+        if fid not in vis_cache:
+            vis_cache[fid] = await get_folder_visibility_chain(db, fid) or "public"
+        folder_list.append(build_folder_response(f, folder_map, effective_visibility=vis_cache[fid]))
 
     return JSONResponse(
         status_code=200,
@@ -103,9 +110,8 @@ async def handle_create_folder(
     {
       "name": "文件夹名",
       "parentId": "父文件夹ID（可选）",
-      "encrypted": false,
-      "password": "加密密码（encrypted=true时必填）",
-      "allowDirectDownload": false
+      "visibility": "public|private|encrypted（默认 public）",
+      "password": "加密密码（visibility=encrypted时必填）"
     }
     """
     await verify_management_token(db, courage_token)
@@ -116,8 +122,13 @@ async def handle_create_folder(
 
     name = body.get("name")
     parent_id = normalize_folder_id(body.get("parentId"))
-    encrypted = body.get("encrypted") is True
-    allow_direct = body.get("allowDirectDownload") is True
+    visibility_value = body.get("visibility")
+    if visibility_value not in ("public", "private", "encrypted", None):
+        raise HTTPException(status_code=400, detail="invalid visibility")
+    if visibility_value is None:
+        # 兼容旧版的 encrypted + allowDirectDownload
+        encrypted = body.get("encrypted") is True
+        visibility_value = "encrypted" if encrypted else "public"
     password = body.get("password") if isinstance(body.get("password"), str) else None
 
     if not isinstance(name, str) or sanitize_index_name(name) is None:
@@ -128,7 +139,7 @@ async def handle_create_folder(
         parent = await get_folder_record(db, parent_id)
         if parent is None:
             raise HTTPException(status_code=404, detail="folder not found")
-        if parent.encrypted:
+        if parent.encrypted or parent.visibility == "encrypted":
             await check_folder_password_token(db, parent_id, target_folder_password_token)
 
     try:
@@ -136,9 +147,8 @@ async def handle_create_folder(
             db=db,
             name=name,
             parent_id=parent_id or None,
-            encrypted=encrypted,
+            visibility=visibility_value,
             password=password,
-            allow_direct_download=allow_direct,
         )
     except PermissionError:
         raise HTTPException(status_code=400, detail="missing folder password")
@@ -159,7 +169,7 @@ async def handle_create_folder(
             "resourceType": "folder",
             "folderId": record.id,
             "parentId": record.parent_id,
-            "encrypted": encrypted,
+            "visibility": visibility_value,
         },
     )
 
